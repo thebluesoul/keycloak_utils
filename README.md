@@ -13,6 +13,35 @@
 
 ---
 
+## Keycloak 설정 절차
+
+1. **Client 생성 (Service Account용)**
+    - 관리콘솔 > [해당 Realm] > Clients > Create
+    - Client ID: 예) `automation-service-account`
+    - Client type: `OpenID Connect`
+    - Access Type: `Confidential`
+    - Service Accounts Enabled: `ON`
+
+2. **Client Credentials 확인**
+    - [생성한 Client] > Credentials > `Client Secret` 확인  
+      → `server.conf`의 `CLIENT_ID`, `CLIENT_SECRET`에 사용
+
+3. **Service Account에 Admin 권한 부여**
+    - [생성한 Client] > Service Account Roles  
+    - 다음 역할(Role) 할당:
+        - `view-users`
+        - `view-realm`
+        - `query-users`
+        - `query-groups`
+        - (`view-events` ← 이벤트 조회 시)
+    - 보안상 최소 권한만 부여 권장
+
+4. **API 엔드포인트(서버 주소) 확인**
+    - 관리 Keycloak 서버의 URL을 `KC_SERVER`에 입력  
+      예: `https://auth.example.com`
+
+---
+
 ## 사용 방법
 
 1. `server.conf` 파일 생성 (예시)
