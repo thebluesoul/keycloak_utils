@@ -27,7 +27,14 @@
 - 패스키 등록률 백분율 계산
 - 부서별 패스키 등록 현황을 `/tmp/groups.txt`에 저장
 
-### 5. `server.conf` - 공통 설정 파일
+### 5. `export-keycloak-user-stats-to-es.sh` - Elasticsearch 사용자 통계 수집
+- Keycloak 사용자 데이터를 Elasticsearch로 수집하는 스크립트
+- 우선순위 기반 @timestamp 생성 (Passkey → OTP → 계정생성)
+- 사용자 그룹 정보 수집 및 JSON 파싱 오류 수정
+- --upload-only 옵션으로 기존 벌크 데이터 파일 업로드 지원 (파일 경로 지정 가능)
+- 벌크 API를 통한 효율적인 Elasticsearch 데이터 전송
+
+### 6. `server.conf` - 공통 설정 파일
 - 모든 스크립트에서 공통으로 사용하는 Keycloak 서버 설정
 - 서버 URL, Realm, 클라이언트 인증 정보 포함
 
@@ -103,6 +110,22 @@
 #### passkey_federated_users.sh - 패스키 등록 현황 분석
 ```bash
 ./passkey_federated_users.sh
+```
+
+#### export-keycloak-user-stats-to-es.sh - Elasticsearch 사용자 통계 수집
+```bash
+# 기본 실행 (데이터 수집 후 Elasticsearch에 업로드)
+./export-keycloak-user-stats-to-es.sh
+
+# 기존 벌크 데이터 파일만 업로드 (기본 파일: es_bulk_data.json)
+./export-keycloak-user-stats-to-es.sh --upload-only
+# 또는 단축 옵션
+./export-keycloak-user-stats-to-es.sh -up
+
+# 특정 벌크 데이터 파일 업로드
+./export-keycloak-user-stats-to-es.sh --upload-only /path/to/custom_bulk_data.json
+# 또는 단축 옵션
+./export-keycloak-user-stats-to-es.sh -up /path/to/custom_bulk_data.json
 ```
 
 ---
@@ -192,6 +215,28 @@ $ ./passkey_federated_users.sh
 ----------------
 ```
 
+### export-keycloak-user-stats-to-es.sh
+```bash
+$ ./export-keycloak-user-stats-to-es.sh
+1. 서비스 계정을 사용하여 Keycloak Admin API 토큰을 발급받습니다.
+토큰 발급 성공!
+
+2. Realm의 모든 사용자 정보를 조회합니다.
+총 사용자 수: 150
+
+3. 각 사용자의 자격증명 및 그룹 정보를 수집합니다...
+진행 상황: 150번째 사용자 처리 중...
+
+4. Elasticsearch 벌크 API를 통해 데이터를 전송합니다...
+Elasticsearch 업로드 성공: 150개 문서
+
+--- 최종 결과 ---
+처리된 사용자 수: 150
+Elasticsearch 저장 성공: 150개 문서
+벌크 데이터 파일: es_bulk_data.json
+----------------
+```
+
 ---
 
 ## 내부 동작
@@ -220,6 +265,14 @@ $ ./passkey_federated_users.sh
 3. 페더레이션 사용자의 크리덴셜 정보 조회(`/admin/realms/{realm}/users/{userId}/credentials`)
 4. `webauthn` 타입 크리덴셜 존재 여부로 패스키 등록 확인
 5. 통계 집계 및 부서별 정보 저장
+
+#### export-keycloak-user-stats-to-es.sh
+1. realm의 모든 사용자 목록 조회
+2. 각 사용자의 상세 정보, 자격증명, 그룹 정보를 순차적으로 수집
+3. 우선순위 기반 @timestamp 생성 (Passkey → OTP → 계정생성)
+4. JSON 데이터 검증 및 오류 처리
+5. Elasticsearch 벌크 API를 통한 일괄 데이터 전송
+6. 성공/실패 통계 및 벌크 데이터 파일 생성
 
 ---
 
@@ -251,6 +304,13 @@ $ ./passkey_federated_users.sh
 4. 페더레이션 사용자 관리 현황 파악
 5. 서비스 계정 및 퇴사자 계정 정리
 
+### export-keycloak-user-stats-to-es.sh
+1. Keycloak 사용자 데이터의 Elasticsearch 수집
+2. Kibana 대시보드를 위한 시계열 데이터 준비
+3. 사용자 인증 패턴 및 트렌드 분석
+4. 패스키 도입 현황의 시각화 및 모니터링
+5. 대용량 사용자 데이터의 체계적 저장 및 관리
+
 ---
 
 ## 주의 사항
@@ -259,11 +319,19 @@ $ ./passkey_federated_users.sh
 - Keycloak API 권한이 충분한 Service Account 필요
 - `jq` 명령어가 시스템에 설치되어 있어야 함
 - `curl` 명령어가 시스템에 설치되어 있어야 함
+- `bc` 명령어가 시스템에 설치되어 있어야 함 (export-keycloak-user-stats-to-es.sh용)
 
 ### 성능 관련
 - 유저 수가 많을 경우(수천~수만 명) API 호출량 증가로 실행에 시간이 소요될 수 있음
 - `passkey_federated_users.sh`는 모든 사용자를 순회하므로 대용량 환경에서 시간이 오래 걸릴 수 있음
 - `get_users_info.sh`는 사용자 수에 비례하여 API 호출이 증가함
+- `export-keycloak-user-stats-to-es.sh`는 Elasticsearch 벌크 API를 사용하므로 네트워크 대역폭 고려 필요
+
+### Elasticsearch 관련
+- `server.conf`에 `ES_URL`과 `ES_INDEX` 설정이 필요함
+- Elasticsearch 서버가 실행 중이어야 함
+- 벌크 데이터 파일(`es_bulk_data.json`)은 Git에서 제외됨
+- 대용량 데이터 처리 시 Elasticsearch 클러스터의 메모리 및 디스크 공간 확인 필요
 
 ### 보안 관련
 - `server.conf` 파일의 클라이언트 시크릿 정보 보안 유지 필요
