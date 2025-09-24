@@ -26,6 +26,11 @@
 - 서비스 계정, 퇴사자 구분하여 통계 제공
 - 패스키 등록률 백분율 계산
 - 부서별 패스키 등록 현황을 `/tmp/groups.txt`에 저장
+  ```
+  [][ubuntu:172x29x70x97]:keycloak_utils$ cat /tmp/groups.txt
+  022bb67e-f1f2-4c4d-a723-615a94deee9a /A회사/연구부문/운영팀
+  그룹_002 /A회사/사업부문/기술팀
+  ```
 
 ### 5. `export-keycloak-user-stats-to-es.sh` - Elasticsearch 사용자 통계 수집
 - Keycloak 사용자 데이터를 Elasticsearch로 수집하는 스크립트
