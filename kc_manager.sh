@@ -30,47 +30,6 @@ ELASTICSEARCH_URL=""
 ES_INDEX_NAME=""
 ES_BULK_FILE=""
 
-# 사용법 출력 함수
-function usage() {
-    echo "사용법: $0 [옵션] [파일경로]"
-    echo ""
-    echo "옵션:"
-    echo "  --collect-all, -ca    전체 프로세스 실행 (사용자 데이터 수집 + Elasticsearch 업로드)"
-    echo "  --upload-only, -up    지정된 JSON 파일을 Elasticsearch에 업로드만 수행"
-    echo "  --upload-sessions, -us 지정된 세션 JSON 파일을 Elasticsearch에 업로드만 수행"
-    echo "  --download-groups, -dg 사용자 그룹 정보만 다운로드하여 JSON 파일로 저장"
-    echo "  --download-sessions, -ds 사용자 세션 정보만 다운로드하여 JSON 파일로 저장"
-    echo "  --send-syslog, -sl    세션 정보를 Syslog 서버로 전송"
-    echo "  --download-auth-flow, -daf 인증 플로우 정보를 다운로드하여 JSON 파일로 저장 (기본값: browser)"
-    echo "  --help               이 도움말을 표시"
-    echo ""
-    echo "예시:"
-    echo "  $0 --collect-all                    # 전체 프로세스 실행 (사용자 데이터 수집 + Elasticsearch 업로드)"
-    echo "  $0 -ca                              # (짧은 형태)"
-    echo ""
-    echo "  $0 --upload-only /tmp/es_bulk_data.json  # 지정된 bulk 파일만 Elasticsearch에 업로드"
-    echo "  $0 -up /tmp/es_bulk_data.json            # (짧은 형태)"
-    echo ""
-    echo "  $0 --upload-only   # 기본 bulk 파일(/tmp/es_bulk_data.json) 업로드"
-    echo "  $0 -up             # (짧은 형태)"
-    echo ""
-    echo "  $0 --upload-sessions user_sessions-2025.09.16_11.23.59.json  # 지정된 세션 파일만 업로드"
-    echo "  $0 -us user_sessions-2025.09.16_11.23.59.json                # (짧은 형태)"
-    echo ""
-    echo "  $0 --download-groups              # 사용자 그룹 정보를 /tmp/user_groups.json에 저장"
-    echo "  $0 -dg /tmp/groups.json           # (짧은 형태)"
-    echo ""
-    echo "  $0 --download-sessions            # 사용자 세션 정보를 /tmp/user_sessions.json에 저장"
-    echo "  $0 -ds /tmp/sessions.json         # (짧은 형태)"
-    echo ""
-    echo "  $0 --send-syslog /path/to/sessions.json  # 세션 정보를 Syslog 서버로 전송"
-    echo "  $0 -sl /tmp/sessions.json                # (짧은 형태)"
-    echo ""
-    echo "  $0 --download-auth-flow browser          # 브라우저 인증 플로우 다운로드"
-    echo "  $0 -daf browser                          # (짧은 형태)"
-    echo "  $0 -daf direct_grant                     # Direct Grant 인증 플로우 다운로드"
-}
-
 # 설정 파일 로드 및 검증 함수
 function load_config() {
     local conf_path="./server.conf"
@@ -97,112 +56,6 @@ function load_config() {
     fi
     
     return 0
-}
-
-# 명령행 인수 파싱 함수
-function parse_arguments() {
-    local collect_all=false
-    local upload_only=false
-    local upload_sessions=false
-    local download_groups=false
-    local download_sessions=false
-    local send_syslog=false
-    local download_auth_flow=false
-    local upload_file=""
-    local upload_sessions_file=""
-    local groups_file=""
-    local sessions_file=""
-    local syslog_file=""
-    local flow_name=""
-    
-while [[ $# -gt 0 ]]; do
-    case $1 in
-            --collect-all|-ca)
-                collect_all=true
-                shift
-                ;;
-        --upload-only|-up)
-                upload_only=true
-                if [ $# -gt 1 ] && [[ "$2" != -* ]]; then
-                    upload_file="$2"
-                    shift
-                fi
-            shift
-            ;;
-        --upload-sessions|-us)
-                upload_sessions=true
-                if [ $# -gt 1 ] && [[ "$2" != -* ]]; then
-                    upload_sessions_file="$2"
-                    shift
-                fi
-            shift
-            ;;
-        --download-groups|-dg)
-                download_groups=true
-                if [ $# -gt 1 ] && [[ "$2" != -* ]]; then
-                    groups_file="$2"
-                    shift
-                fi
-            shift
-            ;;
-        --download-sessions|-ds)
-                download_sessions=true
-                if [ $# -gt 1 ] && [[ "$2" != -* ]]; then
-                    sessions_file="$2"
-                    shift
-                fi
-            shift
-            ;;
-            --send-syslog|-sl)
-                send_syslog=true
-                if [ $# -gt 1 ] && [[ "$2" != -* ]]; then
-                    syslog_file="$2"
-                    shift
-                fi
-                shift
-                ;;
-            --download-auth-flow|-daf)
-                download_auth_flow=true
-                if [ $# -gt 1 ] && [[ "$2" != -* ]]; then
-                    flow_name="$2"
-                    shift
-                fi
-                shift
-                ;;
-            --help|-h)
-            usage
-            exit 0
-            ;;
-        *)
-                if [ "$send_syslog" = true ] && [ -z "$syslog_file" ]; then
-                    syslog_file="$1"
-                    shift
-                elif [ "$download_auth_flow" = true ] && [ -z "$flow_name" ]; then
-                    flow_name="$1"
-                    shift
-                elif [ "$download_sessions" = true ] && [ -z "$sessions_file" ]; then
-                    sessions_file="$1"
-                    shift
-                elif [ "$upload_sessions" = true ] && [ -z "$upload_sessions_file" ]; then
-                    upload_sessions_file="$1"
-                    shift
-                elif [ "$download_groups" = true ] && [ -z "$groups_file" ]; then
-                    groups_file="$1"
-                    shift
-                elif [ "$upload_only" = true ] && [ -z "$upload_file" ]; then
-                    upload_file="$1"
-                    shift
-                else
-                    echo "오류: 알 수 없는 인수: $1" >&2
-            usage
-            exit 1
-                fi
-            ;;
-    esac
-done
-
-    # 결과 반환을 위해 함수 출력 사용
-    echo "$collect_all|$upload_only|$upload_sessions|$download_groups|$download_sessions|$send_syslog|$download_auth_flow|$upload_file|$upload_sessions_file|$groups_file|$sessions_file|$syslog_file|$flow_name"
 }
 
 # Keycloak 서비스 계정 토큰 발급 함수
@@ -609,7 +462,7 @@ function handle_download_sessions() {
     echo ""
     echo "파일 내용 미리보기 (처음 3명):"
     jq '.[0:3]' "$sessions_file"
-    
+
     echo ""
     # echo "Elasticsearch에 세션 데이터를 업로드합니다..."
     
@@ -867,7 +720,8 @@ function handle_send_syslog() {
                 ((errors++))
                 continue
             fi
-            syslog_msg="user=$username ip=$ip_address last_access=\"$last_access_kst\" clients=\"$clients\""
+            local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            syslog_msg="TIMESTAMP=$timestamp USERID=$username SIP=$ip_address LOGDATE=\"$last_access_kst\" clients=\"$clients\""
         fi
 
         if ! logger --rfc3164 -n "$syslog_server" -P "$syslog_port" -t "$syslog_program" "$syslog_msg"; then
