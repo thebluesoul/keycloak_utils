@@ -1,347 +1,490 @@
-# Keycloak 관리 유틸리티 스크립트 모음
+# Keycloak 이벤트 관리 및 Syslog 전송 유틸리티
 
-본 폴더는 Keycloak REST API를 활용하여 다양한 사용자 관리 작업을 수행하는 스크립트들을 포함합니다.
+Keycloak REST API를 활용하여 사용자 이벤트와 관리자 이벤트를 수집하고, Syslog 서버로 전송하는 통합 관리 스크립트입니다.
 
 ---
 
-## 포함된 스크립트
+## 주요 기능
 
-### 1. `session_cnt.sh` - 활성 사용자(세션) 집계
-- Keycloak 관리콘솔 > Sessions 화면과 동일한 활성 사용자(로그인 세션 보유 user) 개수 출력
-- Client별 세션 중복 없이 **User 기준**으로 집계
-- 진행 상황을 `.`으로 출력
+### `kc_manager.sh` - 통합 Keycloak 관리 스크립트
 
-### 2. `get_user_info.sh` - 단일 사용자 정보 조회
-- 특정 사용자 ID로 상세 프로필 정보 조회
-- 사용자명, 이름, 이메일, 활성 상태, 소속 그룹 정보 출력
-- 스크립트 내부에 기본 사용자 ID 설정 가능
+#### 이벤트 관리
+- **사용자 이벤트 다운로드** (증분 방식)
+  - 로그인, 로그아웃, 인증 실패 등 사용자 활동 이벤트 수집
+  - 중복 방지 메커니즘 (마지막 처리 시간 기반)
+  - 페이지네이션 지원 (대용량 이벤트 처리)
 
-### 3. `get_users_info.sh` - 다중 사용자 정보 조회
-- 여러 사용자 ID를 한 번에 조회
-- 각 사용자의 프로필 정보와 그룹 경로 정보 출력
-- 명령행 인자로 사용자 ID 목록 전달
+- **관리자 이벤트 다운로드** (증분 방식)
+  - 사용자 생성/수정/삭제 등 관리자 작업 이력 수집
+  - 독립적인 상태 관리
 
-### 4. `passkey_federated_users.sh` - 패스키 등록 현황 분석
-- 페더레이션 사용자 중 패스키를 등록한 사용자 수 집계
-- 서비스 계정, 퇴사자 구분하여 통계 제공
-- 패스키 등록률 백분율 계산
-- 부서별 패스키 등록 현황을 `/tmp/groups.txt`에 저장
-  ```
-  [][ubuntu:172x29x70x97]:keycloak_utils$ cat /tmp/groups.txt
-  022bb67e-f1f2-4c4d-a723-615a94deee9a /A회사/연구부문/운영팀
-  그룹_002 /A회사/사업부문/기술팀
-  ```
+#### Syslog 통합
+- **Syslog 포맷 변환**
+  - RFC3164 형식 준수
+  - 사용자/관리자 이벤트별 필드 매핑
+  
+- **외부 Syslog 서버 전송**
+  - SIEM 시스템 연동
+  - 중앙 집중식 로그 관리
+  - 보안 감사 및 규정 준수
 
-### 5. `export-keycloak-user-stats-to-es.sh` - Elasticsearch 사용자 통계 수집
-- Keycloak 사용자 데이터를 Elasticsearch로 수집하는 스크립트
-- 우선순위 기반 @timestamp 생성 (Passkey → OTP → 계정생성)
-- 사용자 그룹 정보 수집 및 JSON 파싱 오류 수정
-- --upload-only 옵션으로 기존 벌크 데이터 파일 업로드 지원 (파일 경로 지정 가능)
-- 벌크 API를 통한 효율적인 Elasticsearch 데이터 전송
-
-### 6. `server.conf` - 공통 설정 파일
-- 모든 스크립트에서 공통으로 사용하는 Keycloak 서버 설정
-- 서버 URL, Realm, 클라이언트 인증 정보 포함
+#### 기타 기능
+- 사용자 세션 정보 수집
+- 사용자 그룹 정보 다운로드
+- 인증 플로우 정보 조회
+- Elasticsearch 데이터 업로드
 
 ---
 
 ## Keycloak 설정 절차
 
-1. **Client 생성 (Service Account용)**
-    - 관리콘솔 > [해당 Realm] > Clients > Create
-    - Client ID: 예) `automation-service-account`
-    - Client type: `OpenID Connect`
-    - Access Type: `Confidential`
-    - Service Accounts Enabled: `ON`
+### 1. Client 생성 (Service Account용)
+- 관리콘솔 > [해당 Realm] > Clients > Create
+- Client ID: 예) `automation-service-account`
+- Client type: `OpenID Connect`
+- Access Type: `Confidential`
+- Service Accounts Enabled: `ON`
 
-2. **Client Credentials 확인**
-    - [생성한 Client] > Credentials > `Client Secret` 확인  
-      → `server.conf`의 `CLIENT_ID`, `CLIENT_SECRET`에 사용
+### 2. Client Credentials 확인
+- [생성한 Client] > Credentials > `Client Secret` 확인  
+  → `server.conf`의 `CLIENT_ID`, `CLIENT_SECRET`에 사용
 
-3. **Service Account에 Admin 권한 부여**
-    - [생성한 Client] > Service Account Roles  
-    - 다음 역할(Role) 할당:
-        - `view-users`
-        - `view-realm`
-        - `query-users`
-        - `query-groups`
-        - (`view-events` ← 이벤트 조회 시)
-    - 보안상 최소 권한만 부여 권장
+### 3. Service Account에 Admin 권한 부여
+- [생성한 Client] > Service Account Roles  
+- 다음 역할(Role) 할당:
+  - `view-users` - 사용자 조회
+  - `view-realm` - 렐름 정보 조회
+  - `query-users` - 사용자 검색
+  - `query-groups` - 그룹 조회
+  - `view-events` - 이벤트 조회 (필수)
+- 보안상 최소 권한만 부여 권장
 
-4. **API 엔드포인트(서버 주소) 확인**
-    - 관리 Keycloak 서버의 URL을 `KC_SERVER`에 입력  
-      예: `https://auth.example.com`
+### 4. API 엔드포인트 확인
+- 관리 Keycloak 서버의 URL을 `KC_SERVER`에 입력  
+  예: `https://auth.example.com`
+
+---
+
+## 설정 파일
+
+### `server.conf` 설정 예시
+
+```bash
+# Keycloak 서버 설정
+KC_SERVER='https://auth.example.com'
+KC_REALM='hq'
+CLIENT_ID='automation-service-account'
+CLIENT_SECRET='your-client-secret-here'
+
+# Elasticsearch 설정 (선택사항)
+ES_URL="http://localhost:9200"
+ES_INDEX="keycloak-events"
+
+# Syslog 서버 설정 (이벤트 전송용)
+SYSLOG_SERVER='192.168.35.178'
+SYSLOG_PORT='6514'
+SYSLOG_PROGRAM='GenianIAM'
+```
 
 ---
 
 ## 사용 방법
 
-### 공통 설정
-1. `server.conf` 파일 설정 (예시)
-    ```
-    KC_SERVER='https://auth.example.com'
-    KC_REALM='example-realm'
-    TARGET_REALM='example-realm'
-    CLIENT_ID='automation-service-account'
-    CLIENT_SECRET='xxxxx...'
-    ```
-
-2. 모든 스크립트에 실행 권한 부여
-    ```bash
-    chmod +x *.sh
-    ```
-
-### 개별 스크립트 사용법
-
-#### session_cnt.sh - 활성 세션 사용자 수 집계
+### 도움말 보기
 ```bash
-./session_cnt.sh
+./kc_manager.sh help
 ```
 
-#### get_user_info.sh - 단일 사용자 정보 조회
-```bash
-# 스크립트 내부 기본 ID 사용
-./get_user_info.sh
-
-# 특정 사용자 ID 지정
-./get_user_info.sh 00000000-0000-0000-0000-000000000000
+**출력**:
 ```
+Usage: ./kc_manager.sh [command] [options]
 
-#### get_users_info.sh - 다중 사용자 정보 조회
-```bash
-./get_users_info.sh USER_ID_1 USER_ID_2 USER_ID_3
-```
-
-#### passkey_federated_users.sh - 패스키 등록 현황 분석
-```bash
-./passkey_federated_users.sh
-```
-
-#### export-keycloak-user-stats-to-es.sh - Elasticsearch 사용자 통계 수집
-```bash
-# 기본 실행 (데이터 수집 후 Elasticsearch에 업로드)
-./export-keycloak-user-stats-to-es.sh
-
-# 기존 벌크 데이터 파일만 업로드 (기본 파일: es_bulk_data.json)
-./export-keycloak-user-stats-to-es.sh --upload-only
-# 또는 단축 옵션
-./export-keycloak-user-stats-to-es.sh -up
-
-# 특정 벌크 데이터 파일 업로드
-./export-keycloak-user-stats-to-es.sh --upload-only /path/to/custom_bulk_data.json
-# 또는 단축 옵션
-./export-keycloak-user-stats-to-es.sh -up /path/to/custom_bulk_data.json
+  collect_all [--include-excluded]            # 전체 프로세스 실행 (수집 + ES 업로드)
+  upload_only [bulk_file]                     # 지정 bulk 파일을 ES로 업로드
+  upload_sessions <sessions.json>             # 세션 JSON을 ES로 업로드
+  download_groups [out.json] [--include-excluded]   # 사용자 그룹 정보 다운로드
+  download_sessions [out.json] [--include-excluded] # 사용자 세션 정보 다운로드
+  download_user_events [out.json]      # 사용자 이벤트 다운로드 (증분)
+  download_admin_events [out.json]     # 관리자 이벤트 다운로드 (증분)
+  show_events_state                    # 이벤트 상태 정보 표시
+  send_user_events_syslog <file.json>  # 사용자 이벤트를 Syslog로 전송
+  send_admin_events_syslog <file.json> # 관리자 이벤트를 Syslog로 전송
+  send_syslog <sessions.json>          # 세션 정보를 Syslog로 전송
+  download_auth_flow [flow]            # 인증 플로우(browser 등) 다운로드
+  help                                 # 도움말 표시
 ```
 
 ---
 
-## 출력 예시
+## 사용 예시
 
-### session_cnt.sh
+### 1. 사용자 이벤트 다운로드
+
 ```bash
-$ ./session_cnt.sh 
-.....................................................
-............................................................
-example-realm realm 관리콘솔 기준 세션 총 개수: 25
-$
+./kc_manager.sh download_user_events
 ```
 
-### get_user_info.sh
-```bash
-$ ./get_user_info.sh
-1. 서비스 계정을 사용하여 Keycloak Admin API 토큰을 발급받습니다.
+**출력 예시**:
+```
+=== Keycloak 사용자 이벤트 다운로드 ===
+서버: https://auth.example.com
+렐름: hq
+클라이언트 ID: automation-service-account
+출력 파일: /path/to/events/user_events-2025.11.14_12.30.00.json
+
+잠금 획득 중...
+토큰 발급 중...
 토큰 발급 성공!
+첫 번째 실행: 모든 이벤트를 다운로드합니다.
 
-2. 사용자 프로필 정보를 조회합니다 (ID: 00000000-0000-0000-0000-000000000000)
+사용자 이벤트 다운로드 중...
+페이지 1: 50개 이벤트 수집 (누적: 50개)
+페이지 2: 더 이상 이벤트가 없습니다.
 
---- 사용자 프로필 정보 ---
-ID        : 00000000-0000-0000-0000-000000000000
-Username  : john.doe
-이름      : DoeJohn
-이메일    : john.doe@example.com
-활성 상태 : true
---------------------------
+총 50개의 이벤트를 다운로드했습니다.
+JSON 파일로 저장 중: /path/to/events/user_events-2025.11.14_12.30.00.json
+파일 크기: 15000 bytes
 
-3. 사용자 그룹 정보를 조회합니다.
+상태 파일 업데이트 중...
+상태 파일 업데이트 성공
+  - 마지막 이벤트 시간: 2025-11-14 12:30:00
+  - 마지막 이벤트 ID: abc123...
+  - 총 처리된 이벤트: 50
 
---- 소속 그룹 정보 ---
-Name: employees
-Path: /employees
+=== 다운로드 완료 ===
+저장된 파일: /path/to/events/user_events-2025.11.14_12.30.00.json
+다운로드된 이벤트: 50개
+```
+
+**특징**:
+- 첫 실행 시 모든 이벤트 다운로드
+- 이후 실행 시 마지막 처리 시간 이후의 이벤트만 다운로드 (증분 방식)
+- 상태 파일 자동 관리 (`state/keycloak_user_events_hq.state`)
+
 ---
-Name: developers
-Path: /employees/developers
+
+### 2. 관리자 이벤트 다운로드
+
+```bash
+./kc_manager.sh download_admin_events
+```
+
+사용자 이벤트와 동일한 방식으로 작동하며, 독립적인 상태 파일로 관리됩니다.
+
 ---
-----------------------
+
+### 2-1. 사용자 필터링 옵션
+
+기본적으로 퇴사자 및 시스템 계정은 제외되지만, `--include-excluded` 옵션을 사용하면 모든 사용자를 포함할 수 있습니다.
+
+#### 사용자 그룹 다운로드 (제외 사용자 포함)
+```bash
+./kc_manager.sh download_groups output.json --include-excluded
 ```
 
-### get_users_info.sh
+#### 사용자 세션 다운로드 (제외 사용자 포함)
 ```bash
-$ ./get_users_info.sh USER_ID_1 USER_ID_2
-1. 서비스 계정을 사용하여 Keycloak Admin API 토큰을 발급받습니다.
-토큰 발급 성공!
-
---- 사용자 프로필 정보 ---
-ID        : USER_ID_1
-Username  : user1
-이름      : UserOne
-이메일    : user1@example.com
-활성 상태 : true
---------------------------
-Path: /employees
-
---- 사용자 프로필 정보 ---
-ID        : USER_ID_2
-Username  : user2
-이름      : UserTwo
-이메일    : user2@example.com
-활성 상태 : true
---------------------------
-Path: /employees/managers
-
-모든 사용자 정보 조회를 완료했습니다.
+./kc_manager.sh download_sessions output.json --include-excluded
 ```
 
-### passkey_federated_users.sh
+#### 전체 통계 수집 (제외 사용자 포함)
 ```bash
-$ ./passkey_federated_users.sh
-1. 서비스 계정을 사용하여 Keycloak Admin API 토큰을 발급받습니다.
-토큰 발급 성공!
-
-2. Realm의 모든 사용자 ID를 조회합니다.
-
-3. 각 사용자를 순회하며 페더레이션 사용자 여부 및 패스키 등록 여부를 확인합니다...
-진행 상황: 236번째 사용자 확인 중... (패스키: 45, 서비스 계정: 12, 퇴사자: 8)
-
---- 최종 결과 ---
-확인한 총 사용자 수: 236
-패스키를 등록한 페더레이션 사용자 수: 45, 19.1%
-서비스 제공을 위한 계정 수: 12
-이름에 '(퇴사)'가 포함된 페더레이션 사용자 수: 8
-----------------
+./kc_manager.sh collect_all --include-excluded
 ```
 
-### export-keycloak-user-stats-to-es.sh
+**제외 기준**:
+- 퇴사자: `lastName` 필드에 "퇴사" 또는 "입사취소" 포함
+- 시스템 계정: `server.conf`의 `EXCLUDED_USERNAMES` 배열에 정의된 사용자명
+
+---
+
+### 3. 이벤트 상태 확인
+
 ```bash
-$ ./export-keycloak-user-stats-to-es.sh
-1. 서비스 계정을 사용하여 Keycloak Admin API 토큰을 발급받습니다.
-토큰 발급 성공!
+./kc_manager.sh show_events_state
+```
 
-2. Realm의 모든 사용자 정보를 조회합니다.
-총 사용자 수: 150
+**출력 예시**:
+```
+=== 사용자 이벤트 상태 정보 ===
+상태 파일: /path/to/state/keycloak_user_events_hq.state
 
-3. 각 사용자의 자격증명 및 그룹 정보를 수집합니다...
-진행 상황: 150번째 사용자 처리 중...
+마지막 이벤트 시간: 2025-11-14 12:30:00 (Epoch: 1763089800000)
+마지막 이벤트 ID: abc123...
+마지막 처리 시각: 2025-11-14T03:30:00.000Z
+총 처리된 이벤트: 50
+========================
 
-4. Elasticsearch 벌크 API를 통해 데이터를 전송합니다...
-Elasticsearch 업로드 성공: 150개 문서
+=== 관리자 이벤트 상태 정보 ===
+상태 파일: /path/to/state/keycloak_admin_events_hq.state
 
---- 최종 결과 ---
-처리된 사용자 수: 150
-Elasticsearch 저장 성공: 150개 문서
-벌크 데이터 파일: es_bulk_data.json
-----------------
+마지막 이벤트 시간: 2025-11-14 12:30:00 (Epoch: 1763089800000)
+마지막 이벤트 ID: def456...
+마지막 처리 시각: 2025-11-14T03:30:00.000Z
+총 처리된 이벤트: 30
+========================
+```
+
+---
+
+### 4. Syslog 전송
+
+#### 사용자 이벤트 전송
+```bash
+./kc_manager.sh send_user_events_syslog events/user_events-2025.11.14_12.30.00.json
+```
+
+#### 관리자 이벤트 전송
+```bash
+./kc_manager.sh send_admin_events_syslog events/admin_events-2025.11.14_12.30.00.json
+```
+
+**출력 예시**:
+```
+=== Keycloak 이벤트 Syslog 전송 ===
+이벤트 타입: user
+입력 파일: events/user_events-2025.11.14_12.30.00.json
+
+총 50개의 이벤트를 처리합니다.
+
+Syslog 서버: 192.168.35.178:6514
+프로그램 이름: GenianIAM
+
+=== 전송 완료 ===
+성공: 50개
+실패: 0개
+총: 50개
+```
+
+**Syslog 포맷**:
+```
+TIMESTAMP="2025-11-14 12:30:00" PROGRAM="GenianIAM" HOST="192.168.35.178" USERID="abc123..." LOGDATE="2025-11-14 11:30:00" SIP="192.168.1.100" AUTH_METHOD="LOGIN"
+```
+
+---
+
+## 자동화 (Cron)
+
+### Cron 설정 예시
+
+```bash
+# crontab -e
+
+# 매 시간마다 사용자 이벤트 수집
+0 * * * * cd /path/to/keycloak_utils && ./kc_manager.sh download_user_events >> /var/log/keycloak_events.log 2>&1
+
+# 매 시간 5분에 관리자 이벤트 수집
+5 * * * * cd /path/to/keycloak_utils && ./kc_manager.sh download_admin_events >> /var/log/keycloak_events.log 2>&1
+
+# 매 시간 10분에 최신 이벤트 Syslog 전송
+10 * * * * cd /path/to/keycloak_utils && LATEST=$(ls -t events/user_events-*.json | head -1) && ./kc_manager.sh send_user_events_syslog "$LATEST" >> /var/log/keycloak_events.log 2>&1
 ```
 
 ---
 
 ## 내부 동작
 
-### 공통 동작
-1. `server.conf`에서 주요 설정 변수 로드
-2. client credentials 방식으로 access token 발급
-3. Keycloak Admin API를 통한 데이터 조회 및 처리
+### 이벤트 다운로드 프로세스
 
-### 개별 스크립트 동작
+1. **상태 파일 조회**
+   - 마지막 처리 시간 확인 (`state/keycloak_user_events_hq.state`)
+   - 첫 실행 시 "0" (모든 이벤트)
 
-#### session_cnt.sh
-1. 대상 realm의 모든 user id 목록 조회
-2. 각 user별 활성 session 유무 체크(`/admin/realms/{realm}/users/{userId}/sessions`)
-3. 한 명의 user가 하나라도 세션이 있으면 1로 카운트
-4. 모든 유저 반복 후 활성 사용자(로그인 세션 보유 user) 총합 출력
+2. **토큰 발급**
+   - Service Account를 사용한 Client Credentials 인증
+   - Access Token 발급
 
-#### get_user_info.sh / get_users_info.sh
-1. 지정된 사용자 ID로 상세 정보 조회(`/admin/realms/{realm}/users/{userId}`)
-2. 사용자 그룹 정보 조회(`/admin/realms/{realm}/users/{userId}/groups`)
-3. JSON 파싱하여 사용자 정보 출력
+3. **API 호출**
+   - `/admin/realms/{realm}/events?dateFrom={last_time}&first={offset}&max=1000`
+   - 페이지네이션 처리 (1000개씩, 최대 100페이지)
 
-#### passkey_federated_users.sh
-1. realm의 모든 사용자 목록 조회
-2. 각 사용자의 `federationLink` 필드 확인하여 페더레이션 사용자 식별
-3. 페더레이션 사용자의 크리덴셜 정보 조회(`/admin/realms/{realm}/users/{userId}/credentials`)
-4. `webauthn` 타입 크리덴셜 존재 여부로 패스키 등록 확인
-5. 통계 집계 및 부서별 정보 저장
+4. **JSON 저장**
+   - `events/` 디렉토리에 타임스탬프 포함 파일명으로 저장
+   - 예: `user_events-2025.11.14_12.30.00.json`
 
-#### export-keycloak-user-stats-to-es.sh
-1. realm의 모든 사용자 목록 조회
-2. 각 사용자의 상세 정보, 자격증명, 그룹 정보를 순차적으로 수집
-3. 우선순위 기반 @timestamp 생성 (Passkey → OTP → 계정생성)
-4. JSON 데이터 검증 및 오류 처리
-5. Elasticsearch 벌크 API를 통한 일괄 데이터 전송
-6. 성공/실패 통계 및 벌크 데이터 파일 생성
+5. **상태 업데이트**
+   - 마지막 이벤트 시간, ID, 총 처리 개수 저장
+   - 백업 파일 생성 (손상 시 복구용)
+
+### Syslog 전송 프로세스
+
+1. **JSON 파일 읽기**
+   - 파일 존재 및 유효성 검사
+   - 이벤트 개수 확인
+
+2. **이벤트별 변환**
+   - 사용자 이벤트: `userId`, `ipAddress`, `type` 추출
+   - 관리자 이벤트: `authDetails.userId`, `authDetails.ipAddress`, `operationType` 추출
+   - Syslog 포맷으로 변환
+
+3. **logger 명령어로 전송**
+   - RFC3164 형식 사용
+   - TCP 포트로 전송
+   - 성공/실패 카운트
+
+### 상태 관리
+
+- **잠금 메커니즘**: 동시 실행 방지 (`.lock` 파일)
+- **백업/복구**: 상태 파일 손상 시 자동 복구
+- **증분 다운로드**: `dateFrom` 파라미터로 중복 방지
 
 ---
 
-## 참고 문서
+## 디렉토리 구조
 
-- [Keycloak 공식 문서 - 세션 보기](https://www.keycloak.org/docs/latest/server_admin/#viewing-sessions)
-- [Keycloak REST API - Users Resource](https://www.keycloak.org/docs-api/21.1.1/rest-api/index.html#_users_resource)
+```
+keycloak_utils/
+├── kc_manager.sh          # 메인 스크립트
+├── server.conf            # 설정 파일
+├── events/                # 다운로드된 이벤트 JSON 파일 (자동 생성)
+│   ├── user_events-2025.11.14_12.30.00.json
+│   └── admin_events-2025.11.14_12.30.00.json
+├── state/                 # 상태 파일 (자동 생성)
+│   ├── keycloak_user_events_hq.state
+│   ├── keycloak_user_events_hq.state.backup
+│   ├── keycloak_admin_events_hq.state
+│   └── keycloak_admin_events_hq.state.backup
+└── README.md              # 본 문서
+```
 
 ---
 
 ## 사용 사례
 
-### session_cnt.sh
-1. 현재 Keycloak realm에 로그인한 사용자(실시간) 집계
-2. 모니터링, 자동화 스크립트/대시보드 집계 활용
-3. 인증 트래픽 분석, 서비스 규모 파악
-4. 운영 중인 Keycloak 서비스의 활성 사용자 트렌드 모니터링
+### 1. 이벤트 모니터링 및 감사
+- 사용자 로그인/로그아웃 이벤트 추적
+- 관리자 작업 이력 감사 (사용자 생성/수정/삭제 등)
+- 보안 이벤트 실시간 모니터링
 
-### get_user_info.sh / get_users_info.sh
-1. 특정 사용자의 상세 정보 확인
-2. 사용자 그룹 소속 현황 파악
-3. 사용자 계정 상태 검증
-4. 대량 사용자 정보 일괄 조회
+### 2. Syslog 통합
+- 외부 SIEM 시스템과 연동
+- 중앙 집중식 로그 관리
+- 보안 정책 준수 및 규정 대응
 
-### passkey_federated_users.sh
-1. 패스키 등록 현황 모니터링
-2. 보안 정책 준수율 측정
-3. 부서별 패스키 도입 현황 분석
-4. 페더레이션 사용자 관리 현황 파악
-5. 서비스 계정 및 퇴사자 계정 정리
+### 3. 자동화 및 스케줄링
+- Cron을 통한 주기적 이벤트 수집
+- 증분 다운로드로 효율적인 데이터 동기화
+- 이벤트 데이터의 장기 보관 및 분석
 
-### export-keycloak-user-stats-to-es.sh
-1. Keycloak 사용자 데이터의 Elasticsearch 수집
-2. Kibana 대시보드를 위한 시계열 데이터 준비
-3. 사용자 인증 패턴 및 트렌드 분석
-4. 패스키 도입 현황의 시각화 및 모니터링
-5. 대용량 사용자 데이터의 체계적 저장 및 관리
+### 4. 문제 해결 및 디버깅
+- 인증 실패 원인 분석
+- 사용자 활동 패턴 파악
+- 시스템 이상 징후 탐지
 
 ---
 
 ## 주의 사항
 
-### 공통 주의사항
+### 필수 요구사항
 - Keycloak API 권한이 충분한 Service Account 필요
 - `jq` 명령어가 시스템에 설치되어 있어야 함
 - `curl` 명령어가 시스템에 설치되어 있어야 함
-- `bc` 명령어가 시스템에 설치되어 있어야 함 (export-keycloak-user-stats-to-es.sh용)
+- `logger` 명령어가 시스템에 설치되어 있어야 함 (Syslog 전송용)
+
+### Syslog 관련
+- `server.conf`에 `SYSLOG_SERVER`, `SYSLOG_PORT`, `SYSLOG_PROGRAM` 설정 필요
+- Syslog 서버가 실행 중이고 네트워크 연결이 가능해야 함
+- 방화벽에서 Syslog 포트(기본 6514) 허용 필요
+- 대량 이벤트 전송 시 Syslog 서버의 처리 용량 고려 필요
+
+### 이벤트 관리 관련
+- 이벤트 다운로드는 증분 방식으로 동작하므로 상태 파일(`state/`) 보존 필요
+- 상태 파일 손상 시 처음부터 모든 이벤트를 다시 다운로드함
+- 동시 실행 방지를 위한 잠금 메커니즘이 있으므로 한 번에 하나의 프로세스만 실행
+- 다운로드된 이벤트 파일(`events/`)은 Git에서 제외되므로 별도 백업 필요
+- Keycloak 이벤트 보관 정책에 따라 오래된 이벤트는 조회되지 않을 수 있음
 
 ### 성능 관련
-- 유저 수가 많을 경우(수천~수만 명) API 호출량 증가로 실행에 시간이 소요될 수 있음
-- `passkey_federated_users.sh`는 모든 사용자를 순회하므로 대용량 환경에서 시간이 오래 걸릴 수 있음
-- `get_users_info.sh`는 사용자 수에 비례하여 API 호출이 증가함
-- `export-keycloak-user-stats-to-es.sh`는 Elasticsearch 벌크 API를 사용하므로 네트워크 대역폭 고려 필요
-
-### Elasticsearch 관련
-- `server.conf`에 `ES_URL`과 `ES_INDEX` 설정이 필요함
-- Elasticsearch 서버가 실행 중이어야 함
-- 벌크 데이터 파일(`es_bulk_data.json`)은 Git에서 제외됨
-- 대용량 데이터 처리 시 Elasticsearch 클러스터의 메모리 및 디스크 공간 확인 필요
+- 이벤트 수가 많을 경우 API 호출량 증가로 실행에 시간이 소요될 수 있음
+- 페이지네이션은 최대 100페이지(100,000개 이벤트)까지 처리
+- 더 많은 이벤트가 있는 경우 더 자주 실행하여 증분 다운로드 권장
 
 ### 보안 관련
 - `server.conf` 파일의 클라이언트 시크릿 정보 보안 유지 필요
 - Service Account는 최소 권한 원칙에 따라 필요한 권한만 부여
+  - 이벤트 조회: `view-events` 권한 필수
+  - 관리자 이벤트 조회: `view-events` 또는 `manage-events` 권한 필요
 - 스크립트 실행 시 네트워크 연결 상태 확인 필요
+- Syslog로 전송되는 이벤트에는 민감한 정보(사용자 ID, IP 주소 등)가 포함되므로 전송 경로 암호화 권장
 
 ---
 
+## 트러블슈팅
+
+### Syslog 전송 실패
+
+**증상**: "경고: 이벤트 전송 실패" 메시지
+
+**원인**:
+- Syslog 서버 연결 불가
+- 방화벽 차단
+- 잘못된 포트 번호
+
+**해결**:
+```bash
+# 1. 서버 연결 확인
+nc -zv $SYSLOG_SERVER $SYSLOG_PORT
+
+# 2. 방화벽 확인
+sudo iptables -L -n | grep $SYSLOG_PORT
+
+# 3. server.conf 설정 확인
+cat server.conf | grep SYSLOG
+```
+
+### 필드 값이 "unknown"
+
+**증상**: Syslog에 `USERID="unknown"` 등으로 표시
+
+**원인**:
+- JSON 필드가 null 또는 누락
+- 잘못된 이벤트 타입 지정
+
+**해결**:
+```bash
+# JSON 구조 확인
+jq '.[0]' events/user_events-*.json
+
+# 필드 존재 여부 확인
+jq '.[0] | has("userId")' events/user_events-*.json
+```
+
+### 동시 실행 오류
+
+**증상**: "오류: 다른 프로세스가 실행 중입니다."
+
+**원인**: 이전 프로세스가 아직 실행 중이거나 비정상 종료로 잠금 파일이 남아있음
+
+**해결**:
+```bash
+# 잠금 파일 확인
+ls -la state/*.lock
+
+# 실행 중인 프로세스 확인
+ps aux | grep kc_manager
+
+# 프로세스가 없다면 잠금 파일 수동 삭제
+rm state/*.lock
+```
+
+---
+
+## 참고 문서
+
+- [Keycloak 공식 문서 - Admin REST API](https://www.keycloak.org/docs-api/latest/rest-api/index.html)
+- [Keycloak 공식 문서 - 이벤트 관리](https://www.keycloak.org/docs/latest/server_admin/#auditing-and-events)
+- [RFC3164 - The BSD syslog Protocol](https://www.ietf.org/rfc/rfc3164.txt)
+
+---
+
+## 라이선스
+
+본 스크립트는 내부 사용을 목적으로 작성되었습니다.
+
+---
+
+## 버전 정보
+
+- **버전**: 1.0.0
+- **최종 업데이트**: 2025-11-14
+- **작성자**: 기세호
