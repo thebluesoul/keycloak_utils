@@ -2,7 +2,7 @@ es_bulk_data.json
 
 # Events directory and state files
 events/
-.state/
+state/
 
 # Logs
 logs

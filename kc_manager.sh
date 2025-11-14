@@ -76,8 +76,9 @@ function load_config() {
     # 이벤트 상태 파일 경로 설정
     USER_EVENTS_STATE_FILE="${EVENT_STATE_DIR}/keycloak_user_events_${REALM}.state"
     ADMIN_EVENTS_STATE_FILE="${EVENT_STATE_DIR}/keycloak_admin_events_${REALM}.state"
-    EVENT_LOCK_FILE="${EVENT_STATE_DIR}/keycloak_events_download_${REALM}.lock"
-    
+    USER_EVENT_LOCK_FILE="${EVENT_STATE_DIR}/keycloak_user_events_download_${REALM}.lock"
+    ADMIN_EVENT_LOCK_FILE="${EVENT_STATE_DIR}/keycloak_admin_events_download_${REALM}.lock"
+ 
     # 필수 설정 확인
     if [ -z "$ELASTICSEARCH_URL" ]; then
         echo "오류: Elasticsearch URL이 설정되지 않았습니다. server.conf 파일에 ES_URL을 추가하세요."
@@ -158,7 +159,7 @@ function acquire_event_lock() {
             
             # 잠금 파일의 PID 확인
             if [ -r "$lock_file" ]; then
-                local lock_pid=$(cat "$lock_file" 2>/dev/null)
+                local lock_pid=$(head -n 1 "$lock_file" 2>/dev/null)
                 if [ -n "$lock_pid" ] && ! ps -p "$lock_pid" > /dev/null 2>&1; then
                     echo "경고: 잠금 파일의 프로세스(PID: $lock_pid)가 존재하지 않습니다. 잠금 파일을 제거합니다." >&2
                     rm -f "$lock_file"
@@ -677,13 +678,7 @@ function handle_download_sessions() {
     local bulk_file="${sessions_file}.bulk"
     
     convert_json_to_bulk "$sessions_file" "$bulk_file" "$index_name" "user_id"
-
-    # 사용자 세션정보를 로컬에 파일로 저장만 하도록 한다. 업로드는 별도의 옵션으로 처리한다.    
-    # local result=$?
-    # if [ $result -eq 0 ]; then
-    #     upload_to_elasticsearch "$bulk_file" "$index_name"
-    #     result=$?
-    # fi
+    local result=$?
     
     rm -f "$bulk_file"
     return $result
@@ -961,13 +956,13 @@ function handle_download_user_events() {
     
     # 1. 잠금 획득
     echo "잠금 획득 중..."
-    if ! acquire_event_lock "$EVENT_LOCK_FILE" 300; then
+    if ! acquire_event_lock "$USER_EVENT_LOCK_FILE" 300; then
         echo "오류: 다른 프로세스가 실행 중입니다." >&2
         return 1
     fi
     
     # trap을 사용한 자동 정리
-    trap "release_event_lock '$EVENT_LOCK_FILE'" EXIT
+    trap "release_event_lock '$USER_EVENT_LOCK_FILE'" EXIT
     
     # 2. 토큰 발급
     echo "토큰 발급 중..."
@@ -1114,13 +1109,13 @@ function handle_download_admin_events() {
     
     # 1. 잠금 획득
     echo "잠금 획득 중..."
-    if ! acquire_event_lock "$EVENT_LOCK_FILE" 300; then
+    if ! acquire_event_lock "$ADMIN_EVENT_LOCK_FILE" 300; then
         echo "오류: 다른 프로세스가 실행 중입니다." >&2
         return 1
     fi
     
     # trap을 사용한 자동 정리
-    trap "release_event_lock '$EVENT_LOCK_FILE'" EXIT
+    trap "release_event_lock '$ADMIN_EVENT_LOCK_FILE'" EXIT
     
     # 2. 토큰 발급
     echo "토큰 발급 중..."
