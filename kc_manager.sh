@@ -30,6 +30,9 @@ ELASTICSEARCH_URL=""
 ES_INDEX_NAME=""
 ES_BULK_FILE=""
 
+# 이벤트 API 호출 간격 (초) - 기본값 1초
+EVENT_API_SLEEP_INTERVAL=1
+
 # Syslog 필드명 (기본값, server.conf에서 재정의 가능)
 SYSLOG_FIELD_TIMESTAMP="TIMESTAMP"
 SYSLOG_FIELD_USERID="USERID"
@@ -69,6 +72,13 @@ function load_config() {
     SYSLOG_FIELD_SIP=${SYSLOG_FIELD_SIP:-"SIP"}
     SYSLOG_FIELD_LOGDATE=${SYSLOG_FIELD_LOGDATE:-"LOGDATE"}
     SYSLOG_FIELD_AUTH_METHOD=${SYSLOG_FIELD_AUTH_METHOD:-"AUTH_METHOD"}
+
+    # 이벤트 API 호출 간격 (server.conf에서 재정의 가능, 기본 1초)
+    EVENT_API_SLEEP_INTERVAL=${EVENT_API_SLEEP:-1}
+    if ! [[ "$EVENT_API_SLEEP_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "경고: EVENT_API_SLEEP 값이 유효하지 않아 기본값 1초를 사용합니다." >&2
+        EVENT_API_SLEEP_INTERVAL=1
+    fi
     
     # 이벤트 상태 디렉토리 생성
     mkdir -p "$EVENT_STATE_DIR"
@@ -102,6 +112,148 @@ function get_keycloak_token() {
     fi
     
     echo "$token"
+    return 0
+}
+
+# Keycloak 서비스 계정 토큰 응답 전체를 반환하는 함수
+function get_token_response() {
+    local response=$(curl -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=client_credentials" \
+        -d "client_id=${SERVICE_ACCOUNT_CLIENT_ID}" \
+        -d "client_secret=${SERVICE_ACCOUNT_CLIENT_SECRET}")
+    
+    if [ -z "$response" ] || ! echo "$response" | jq -e . >/dev/null 2>&1; then
+        echo "오류: 서비스 계정 토큰 발급 실패." >&2
+        return 1
+    fi
+    
+    local error=$(echo "$response" | jq -r '.error // empty')
+    if [ -n "$error" ] && [ "$error" != "null" ]; then
+        local error_desc=$(echo "$response" | jq -r '.error_description // ""')
+        echo "오류: 토큰 발급 실패 - $error" >&2
+        if [ -n "$error_desc" ] && [ "$error_desc" != "null" ]; then
+            echo "상세: $error_desc" >&2
+        fi
+        return 1
+    fi
+    
+    echo "$response"
+    return 0
+}
+
+# JWT 토큰 디코딩 함수
+function decode_token() {
+    local token="$1"
+    
+    if [ -z "$token" ] || [ "$token" = "null" ]; then
+        echo "오류: 토큰이 제공되지 않았습니다." >&2
+        return 1
+    fi
+    
+    # JWT는 3부분으로 구성: header.payload.signature
+    local parts=$(echo "$token" | tr '.' '\n' | wc -l)
+    if [ "$parts" -ne 3 ]; then
+        echo "오류: 유효하지 않은 JWT 토큰 형식입니다." >&2
+        return 1
+    fi
+    
+    # Payload 부분 디코딩 (2번째 부분)
+    local payload=$(echo "$token" | cut -d'.' -f2)
+    
+    # Base64 디코딩 (패딩 추가)
+    local padding=$((4 - ${#payload} % 4))
+    if [ $padding -ne 4 ]; then
+        payload="${payload}$(printf '%*s' $padding | tr ' ' '=')"
+    fi
+    
+    echo "$payload" | base64 -d 2>/dev/null | jq . 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo "오류: 토큰 디코딩 실패." >&2
+        return 1
+    fi
+    
+    return 0
+}
+
+# 토큰 정보를 사람이 읽을 수 있는 형식으로 표시하는 함수
+function display_token_info() {
+    local token="$1"
+    
+    if [ -z "$token" ]; then
+        echo "오류: 토큰이 제공되지 않았습니다." >&2
+        return 1
+    fi
+    
+    local decoded=$(decode_token "$token")
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+    
+    echo "=== 토큰 정보 ==="
+    echo ""
+    
+    # 기본 정보
+    local iss=$(echo "$decoded" | jq -r '.iss // "N/A"')
+    local sub=$(echo "$decoded" | jq -r '.sub // "N/A"')
+    local aud=$(echo "$decoded" | jq -r '.aud // "N/A"')
+    local azp=$(echo "$decoded" | jq -r '.azp // "N/A"')
+    
+    echo "발급자 (iss): $iss"
+    echo "주체 (sub): $sub"
+    echo "대상 (aud): $aud"
+    echo "인증된 당사자 (azp): $azp"
+    echo ""
+    
+    # 시간 정보
+    local iat=$(echo "$decoded" | jq -r '.iat // "N/A"')
+    local exp=$(echo "$decoded" | jq -r '.exp // "N/A"')
+    local nbf=$(echo "$decoded" | jq -r '.nbf // "N/A"')
+    
+    if [ "$iat" != "N/A" ] && [ "$iat" != "null" ]; then
+        local iat_readable=$(date -d "@$iat" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "N/A")
+        echo "발급 시간 (iat): $iat ($iat_readable)"
+    fi
+    
+    if [ "$exp" != "N/A" ] && [ "$exp" != "null" ]; then
+        local exp_readable=$(date -d "@$exp" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "N/A")
+        local current_time=$(date +%s)
+        local remaining=$((exp - current_time))
+        
+        echo "만료 시간 (exp): $exp ($exp_readable)"
+        
+        if [ $remaining -gt 0 ]; then
+            local remaining_min=$((remaining / 60))
+            local remaining_sec=$((remaining % 60))
+            echo "남은 시간: ${remaining_min}분 ${remaining_sec}초"
+        else
+            echo "상태: 만료됨"
+        fi
+    fi
+    
+    if [ "$nbf" != "N/A" ] && [ "$nbf" != "null" ]; then
+        local nbf_readable=$(date -d "@$nbf" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "N/A")
+        echo "유효 시작 시간 (nbf): $nbf ($nbf_readable)"
+    fi
+    
+    echo ""
+    
+    # Realm 정보
+    local realm_access=$(echo "$decoded" | jq -r '.realm_access.roles // []' 2>/dev/null)
+    if [ -n "$realm_access" ] && [ "$realm_access" != "[]" ] && [ "$realm_access" != "null" ]; then
+        echo "Realm 역할:"
+        echo "$realm_access" | jq -r '.[]' | sed 's/^/  - /'
+        echo ""
+    fi
+    
+    # Resource access 정보
+    local resource_access=$(echo "$decoded" | jq -r '.resource_access // {}' 2>/dev/null)
+    if [ -n "$resource_access" ] && [ "$resource_access" != "{}" ] && [ "$resource_access" != "null" ]; then
+        echo "리소스 접근 권한:"
+        echo "$resource_access" | jq -r 'to_entries[] | "  \(.key): \(.value.roles // [])"' | sed 's/\[\]//g'
+        echo ""
+    fi
+    
     return 0
 }
 
@@ -1035,7 +1187,7 @@ function handle_download_user_events() {
         fi
         
         # API 호출 간격 (rate limiting 방지)
-        sleep 0.1
+        sleep "$EVENT_API_SLEEP_INTERVAL"
     done
     
     echo ""
@@ -1188,7 +1340,7 @@ function handle_download_admin_events() {
         fi
         
         # API 호출 간격 (rate limiting 방지)
-        sleep 0.1
+        sleep "$EVENT_API_SLEEP_INTERVAL"
     done
     
     echo ""
@@ -1729,6 +1881,9 @@ function cmd_help()
     echo "  send_admin_events_syslog <file.json> # 관리자 이벤트를 Syslog로 전송"
     echo "  send_syslog <sessions.json>          # 세션 정보를 Syslog로 전송"
     echo "  download_auth_flow [flow]            # 인증 플로우(browser 등) 다운로드"
+    echo "  get_token                            # 토큰 발급 및 정보 표시"
+    echo "  refresh_token [refresh_token]         # Refresh token으로 토큰 갱신"
+    echo "  token_info [access_token]            # 토큰 정보 확인 (만료 시간, 권한 등)"
     echo "  help                                 # 도움말 표시"
 }
 
@@ -1894,6 +2049,171 @@ function cmd_send_admin_events_syslog()
     fi
     
     handle_send_events_to_syslog "$json_file" "admin"
+}
+
+function cmd_get_token()
+{
+    load_config || return 1
+    
+    echo "=== Keycloak 토큰 발급 ==="
+    echo "서버: $KEYCLOAK_URL"
+    echo "Realm: $REALM"
+    echo "클라이언트 ID: $SERVICE_ACCOUNT_CLIENT_ID"
+    echo ""
+    
+    local token_response=$(get_token_response)
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+    
+    local access_token=$(echo "$token_response" | jq -r '.access_token // empty')
+    local refresh_token=$(echo "$token_response" | jq -r '.refresh_token // empty')
+    local expires_in=$(echo "$token_response" | jq -r '.expires_in // "N/A"')
+    local refresh_expires_in=$(echo "$token_response" | jq -r '.refresh_expires_in // "N/A"')
+    local token_type=$(echo "$token_response" | jq -r '.token_type // "N/A"')
+    local scope=$(echo "$token_response" | jq -r '.scope // "N/A"')
+    
+    echo "=== 토큰 발급 성공 ==="
+    echo ""
+    echo "토큰 타입: $token_type"
+    echo "유효 기간: ${expires_in}초"
+    if [ "$refresh_expires_in" != "N/A" ] && [ "$refresh_expires_in" != "null" ]; then
+        echo "Refresh 토큰 유효 기간: ${refresh_expires_in}초"
+    fi
+    if [ "$scope" != "N/A" ] && [ "$scope" != "null" ] && [ -n "$scope" ]; then
+        echo "Scope: $scope"
+    fi
+    echo ""
+    
+    if [ -n "$access_token" ] && [ "$access_token" != "null" ]; then
+        echo "=== Access Token 정보 ==="
+        display_token_info "$access_token"
+        echo ""
+        echo "=== Access Token (전체) ==="
+        echo "$access_token"
+        echo ""
+    fi
+    
+    if [ -n "$refresh_token" ] && [ "$refresh_token" != "null" ]; then
+        echo "=== Refresh Token ==="
+        echo "$refresh_token"
+        echo ""
+        echo "토큰 갱신 방법:"
+        echo "  $0 refresh_token \"$refresh_token\""
+        echo ""
+    else
+        echo "참고: Client Credentials Grant는 일반적으로 refresh token을 반환하지 않습니다."
+        echo "토큰이 만료되면 다시 get_token 명령을 실행하세요."
+        echo ""
+    fi
+    
+    return 0
+}
+
+function cmd_refresh_token()
+{
+    load_config || return 1
+    
+    local refresh_token="$1"
+    
+    if [ -z "$refresh_token" ]; then
+        echo "오류: Refresh token이 제공되지 않았습니다." >&2
+        echo "사용법: $0 refresh_token <refresh_token>" >&2
+        echo ""
+        echo "또는 get_token 명령으로 발급받은 refresh token을 사용하세요."
+        return 1
+    fi
+    
+    echo "=== Keycloak 토큰 갱신 ==="
+    echo "서버: $KEYCLOAK_URL"
+    echo "Realm: $REALM"
+    echo "클라이언트 ID: $SERVICE_ACCOUNT_CLIENT_ID"
+    echo ""
+    
+    local response=$(curl -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=refresh_token" \
+        -d "refresh_token=${refresh_token}" \
+        -d "client_id=${SERVICE_ACCOUNT_CLIENT_ID}" \
+        -d "client_secret=${SERVICE_ACCOUNT_CLIENT_SECRET}")
+    
+    if [ -z "$response" ] || ! echo "$response" | jq -e . >/dev/null 2>&1; then
+        echo "오류: 토큰 갱신 실패." >&2
+        return 1
+    fi
+    
+    local error=$(echo "$response" | jq -r '.error // empty')
+    if [ -n "$error" ] && [ "$error" != "null" ]; then
+        local error_desc=$(echo "$response" | jq -r '.error_description // ""')
+        echo "오류: 토큰 갱신 실패 - $error" >&2
+        if [ -n "$error_desc" ] && [ "$error_desc" != "null" ]; then
+            echo "상세: $error_desc" >&2
+        fi
+        return 1
+    fi
+    
+    local access_token=$(echo "$response" | jq -r '.access_token // empty')
+    local new_refresh_token=$(echo "$response" | jq -r '.refresh_token // empty')
+    local expires_in=$(echo "$response" | jq -r '.expires_in // "N/A"')
+    local refresh_expires_in=$(echo "$response" | jq -r '.refresh_expires_in // "N/A"')
+    local token_type=$(echo "$response" | jq -r '.token_type // "N/A"')
+    
+    echo "=== 토큰 갱신 성공 ==="
+    echo ""
+    echo "토큰 타입: $token_type"
+    echo "유효 기간: ${expires_in}초"
+    if [ "$refresh_expires_in" != "N/A" ] && [ "$refresh_expires_in" != "null" ]; then
+        echo "Refresh 토큰 유효 기간: ${refresh_expires_in}초"
+    fi
+    echo ""
+    
+    if [ -n "$access_token" ] && [ "$access_token" != "null" ]; then
+        echo "=== 새 Access Token 정보 ==="
+        display_token_info "$access_token"
+        echo ""
+        echo "=== 새 Access Token (전체) ==="
+        echo "$access_token"
+        echo ""
+    fi
+    
+    if [ -n "$new_refresh_token" ] && [ "$new_refresh_token" != "null" ]; then
+        echo "=== 새 Refresh Token ==="
+        echo "$new_refresh_token"
+        echo ""
+        echo "다음 갱신 방법:"
+        echo "  $0 refresh_token \"$new_refresh_token\""
+        echo ""
+    fi
+    
+    return 0
+}
+
+function cmd_token_info()
+{
+    load_config || return 1
+    
+    local token="$1"
+    
+    if [ -z "$token" ]; then
+        # 토큰이 제공되지 않으면 새로 발급
+        echo "토큰이 제공되지 않아 새로 발급합니다..."
+        echo ""
+        local token_response=$(get_token_response)
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+        token=$(echo "$token_response" | jq -r '.access_token // empty')
+        
+        if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "오류: 토큰을 발급받을 수 없습니다." >&2
+            return 1
+        fi
+        echo ""
+    fi
+    
+    display_token_info "$token"
+    
+    return 0
 }
 
 function cmd_()
