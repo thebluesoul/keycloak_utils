@@ -1249,6 +1249,36 @@ function handle_download_admin_events() {
     return 0
 }
 
+# Realm ID로 realm name을 조회하는 함수
+function get_realm_name_by_id() {
+    local realm_id="$1"
+    local access_token="$2"
+    
+    if [ -z "$realm_id" ] || [ "$realm_id" = "unknown" ] || [ "$realm_id" = "null" ] || [ -z "$access_token" ]; then
+        echo ""
+        return 1
+    fi
+    
+    # 모든 realm 목록 조회 (Realm ID로 직접 조회하는 엔드포인트가 없으므로)
+    local realms_list=$(curl -s -X GET \
+        "${KEYCLOAK_URL}/admin/realms" \
+        -H "Authorization: Bearer ${access_token}" 2>/dev/null)
+    
+    if [ $? -eq 0 ] && echo "$realms_list" | jq -e . >/dev/null 2>&1; then
+        # Realm ID로 필터링하여 realm name 찾기
+        local realm_name=$(echo "$realms_list" | jq -r --arg realm_id "$realm_id" \
+            '.[] | select(.id == $realm_id) | .realm // empty' 2>/dev/null)
+        
+        if [ -n "$realm_name" ] && [ "$realm_name" != "null" ]; then
+            echo "$realm_name"
+            return 0
+        fi
+    fi
+    
+    echo ""
+    return 1
+}
+
 # Syslog 메시지 포맷을 생성하는 공통 함수
 function build_syslog_message() {
     local username="$1"
@@ -1390,6 +1420,15 @@ function convert_admin_event_to_syslog() {
     
     # 필드 추출 (관리자 이벤트는 authDetails 안에 정보가 있음)
     local event_id=$(echo "$event" | jq -r '.id // "unknown"')
+    
+    # event_id가 없으면 함수 종료
+    if [ -z "$event_id" ] || [ "$event_id" = "unknown" ] || [ "$event_id" = "null" ]; then
+        if [ "$DEBUG" = "1" ]; then
+            echo "DEBUG: event_id가 없어서 이벤트를 건너뜁니다." >&2
+        fi
+        return 1
+    fi
+    
     local user_id=$(echo "$event" | jq -r '.authDetails.userId // "unknown"')
     local ip_address=$(echo "$event" | jq -r '.authDetails.ipAddress // "unknown"')
     local operation_type=$(echo "$event" | jq -r '.operationType // "unknown"')
@@ -1401,6 +1440,7 @@ function convert_admin_event_to_syslog() {
     # username 추출 (관리자 이벤트는 details.username이 없으므로 API 호출)
     local username="$user_id"
     if [ "$user_id" != "unknown" ] && [ -n "$access_token" ]; then
+        # 1. 기본 realm에서 먼저 검색
         local user_info=$(curl -s -X GET \
             "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}" \
             -H "Authorization: Bearer ${access_token}" 2>/dev/null)
@@ -1410,6 +1450,41 @@ function convert_admin_event_to_syslog() {
             
             if [ -n "$fetched_username" ] && [ "$fetched_username" != "null" ]; then
                 username="$fetched_username"
+            fi
+        else
+            # 2. 기본 realm에서 찾지 못한 경우, authDetails.realmId에 해당하는 realm에서 검색
+            local event_realm_id=$(echo "$event" | jq -r '.authDetails.realmId // empty')
+            
+            if [ -n "$event_realm_id" ] && [ "$event_realm_id" != "null" ] && [ "$event_realm_id" != "unknown" ]; then
+                # Realm ID로 realm name 조회
+                local event_realm_name=$(get_realm_name_by_id "$event_realm_id" "$access_token")
+                
+                # Realm name을 찾지 못한 경우 (권한이 없거나 realm이 존재하지 않음)
+                if [ -z "$event_realm_name" ]; then
+                    if [ "$DEBUG" = "1" ]; then
+                        echo "DEBUG: Realm ID(${event_realm_id})에 해당하는 realm name을 찾을 수 없음. 접근 권한이 없거나 realm이 존재하지 않을 수 있습니다." >&2
+                    fi
+                elif [ "$event_realm_name" != "${REALM}" ]; then
+                    # 다른 realm에서 사용자 검색
+                    if [ "$DEBUG" = "1" ]; then
+                        echo "DEBUG: 기본 realm(${REALM})에서 사용자를 찾지 못함. authDetails.realmId(${event_realm_id})에 해당하는 realm(${event_realm_name})에서 검색 시도" >&2
+                    fi
+                    
+                    user_info=$(curl -s -X GET \
+                        "${KEYCLOAK_URL}/admin/realms/${event_realm_name}/users/${user_id}" \
+                        -H "Authorization: Bearer ${access_token}" 2>/dev/null)
+                    
+                    if [ $? -eq 0 ] && echo "$user_info" | jq -e . >/dev/null 2>&1; then
+                        fetched_username=$(echo "$user_info" | jq -r '.username // empty')
+                        
+                        if [ -n "$fetched_username" ] && [ "$fetched_username" != "null" ]; then
+                            username="$fetched_username"
+                            if [ "$DEBUG" = "1" ]; then
+                                echo "DEBUG: realm(${event_realm_name})에서 사용자 찾음: ${username}" >&2
+                            fi
+                        fi
+                    fi
+                fi
             fi
         fi
     fi
@@ -1493,6 +1568,7 @@ function handle_send_events_to_syslog() {
     # 이벤트 처리
     local processed=0
     local errors=0
+    local skipped=0
     local index=0
     
     # jq로 이벤트를 하나씩 읽어서 처리
@@ -1505,13 +1581,29 @@ function handle_send_events_to_syslog() {
         
         # 이벤트 타입에 따라 변환 함수 선택
         local syslog_message=""
+        local convert_result=0
+        
         if [ "$event_type" = "user" ]; then
             syslog_message=$(convert_user_event_to_syslog "$event" "$syslog_server" "$syslog_program" "$access_token" "$json_file")
+            convert_result=$?
         elif [ "$event_type" = "admin" ]; then
             syslog_message=$(convert_admin_event_to_syslog "$event" "$syslog_server" "$syslog_program" "$access_token" "$json_file")
+            convert_result=$?
         else
             echo "오류: 알 수 없는 이벤트 타입: $event_type" >&2
             return 1
+        fi
+        
+        # 변환 함수가 건너뛰기를 요청한 경우 (return 1)
+        if [ $convert_result -ne 0 ] || [ -z "$syslog_message" ]; then
+            ((skipped++))
+            # ID 표시 형식 (8자 초과 시 ... 추가)
+            local id_display="${event_id:0:8}"
+            if [ ${#event_id} -gt 8 ]; then
+                id_display="${id_display}..."
+            fi
+            echo "[${index}/${event_count}] 건너뜀 - ID: ${id_display} | IP: ${event_ip}"
+            continue
         fi
         
         # syslog_message에서 username 추출 (중복 호출 방지, 변수 사용)
@@ -1542,6 +1634,9 @@ function handle_send_events_to_syslog() {
     echo "=== 전송 완료 ==="
     echo "성공: ${processed}개"
     echo "실패: ${errors}개"
+    if [ $skipped -gt 0 ]; then
+        echo "건너뜀: ${skipped}개"
+    fi
     echo "총: ${event_count}개"
     
     [ $errors -eq 0 ] && return 0 || return 1
