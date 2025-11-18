@@ -47,6 +47,50 @@ USER_EVENTS_STATE_FILE=""
 ADMIN_EVENTS_STATE_FILE=""
 EVENT_LOCK_FILE=""
 
+# epoch(ms 또는 s) → YYYY-MM-DD HH:MM:SS 변환 함수
+function epoch_to_datetime() {
+    local epoch_value="$1"
+
+    if [ -z "$epoch_value" ] || ! [[ "$epoch_value" =~ ^[0-9]+$ ]]; then
+        echo ""
+        return 1
+    fi
+
+    local epoch_sec="$epoch_value"
+    if [ ${#epoch_value} -gt 10 ]; then
+        epoch_sec=$((epoch_value / 1000))
+    fi
+
+    local formatted
+    formatted=$(date -d "@$epoch_sec" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+    if [ -z "$formatted" ]; then
+        echo ""
+        return 1
+    fi
+
+    echo "$formatted"
+    return 0
+}
+
+# datetime → epoch milliseconds 변환 함수
+function datetime_to_epoch_ms() {
+    local datetime="$1"
+    if [ -z "$datetime" ]; then
+        echo ""
+        return 1
+    fi
+
+    local epoch_s
+    epoch_s=$(date -d "$datetime" +%s 2>/dev/null)
+    if [ -z "$epoch_s" ]; then
+        echo ""
+        return 1
+    fi
+
+    echo $((epoch_s * 1000))
+    return 0
+}
+
 # 설정 파일 로드 및 검증 함수
 function load_config() {
     local conf_path="./server.conf"
@@ -1401,6 +1445,114 @@ function handle_download_admin_events() {
     return 0
 }
 
+# 사용자 이벤트 파일을 시간 범위로 필터링하는 함수
+function filter_user_events_by_time_range() {
+    local input_file="$1"
+    local output_file="$2"
+    local start_datetime="$3"
+    local end_datetime="$4"
+
+    if [ -z "$input_file" ] || [ -z "$output_file" ] || [ -z "$start_datetime" ] || [ -z "$end_datetime" ]; then
+        echo "오류: 입력/출력 파일과 시작/종료 시간을 모두 지정해야 합니다." >&2
+        return 1
+    fi
+
+    if [ ! -f "$input_file" ]; then
+        echo "오류: 입력 파일을 찾을 수 없습니다: $input_file" >&2
+        return 1
+    fi
+
+    local start_ms=""
+    local end_ms=""
+    local has_start=1
+    local has_end=1
+
+    if [ "$start_datetime" = "*" ] || [ -z "$start_datetime" ]; then
+        has_start=0
+        start_ms=0
+    else
+        start_ms=$(datetime_to_epoch_ms "$start_datetime")
+        if [ -z "$start_ms" ]; then
+            echo "오류: 시작 시간을 epoch(ms)로 변환할 수 없습니다. 예시: \"2025-11-14 00:00:00\"" >&2
+            return 1
+        fi
+    fi
+
+    if [ "$end_datetime" = "*" ] || [ -z "$end_datetime" ]; then
+        has_end=0
+        end_ms=0
+    else
+        end_ms=$(datetime_to_epoch_ms "$end_datetime")
+        if [ -z "$end_ms" ]; then
+            echo "오류: 종료 시간을 epoch(ms)로 변환할 수 없습니다. 예시: \"2025-11-14 00:00:00\"" >&2
+            return 1
+        fi
+    fi
+
+    if [ "$has_start" -eq 1 ] && [ "$has_end" -eq 1 ] && [ "$start_ms" -gt "$end_ms" ]; then
+        echo "오류: 시작 시간이 종료 시간보다 클 수 없습니다." >&2
+        return 1
+    fi
+
+    local tmp_file="${output_file}.tmp"
+
+    local start_label end_label
+    if [ "$has_start" -eq 1 ]; then
+        start_label="${start_datetime} (포함)"
+    else
+        start_label="* (제한 없음)"
+    fi
+    if [ "$has_end" -eq 1 ]; then
+        end_label="${end_datetime} (제외)"
+    else
+        end_label="* (무제한)"
+    fi
+
+    echo "필터링 중... (범위: [${start_label}, ${end_label}))"
+    local jq_filter_file
+    jq_filter_file=$(mktemp "/tmp/kc_event_filter.XXXXXX")
+    cat <<'EOF' > "$jq_filter_file"
+[
+  .[] |
+  (try (.time | tonumber) catch 0) as $event_time |
+  select(
+    (
+      ($has_start == 0) or
+      ($event_time >= $start)
+    ) and
+    (
+      ($has_end == 0) or
+      ($event_time < $end_ts)
+    )
+  )
+]
+EOF
+
+    if ! jq -c \
+        --argjson start "$start_ms" \
+        --argjson end_ts "$end_ms" \
+        --argjson has_start "$has_start" \
+        --argjson has_end "$has_end" \
+        -f "$jq_filter_file" "$input_file" > "$tmp_file"; then
+        echo "오류: jq 필터링 중 문제가 발생했습니다." >&2
+        rm -f "$tmp_file"
+        rm -f "$jq_filter_file"
+        return 1
+    fi
+
+    rm -f "$jq_filter_file"
+
+    mv "$tmp_file" "$output_file"
+    local filtered_count
+    filtered_count=$(jq 'length' "$output_file" 2>/dev/null || echo 0)
+    echo "필터링 완료: ${filtered_count}개 이벤트가 ${output_file}에 저장되었습니다."
+    echo "※ 범위 규칙: 시작 시각 이상(>=), 종료 시각 미만(<) — [start, end)"
+    echo "이 파일을 기존 명령으로 전송하세요:"
+    echo "  $0 send_user_events_syslog \"$output_file\""
+
+    return 0
+}
+
 # Realm ID로 realm name을 조회하는 함수
 function get_realm_name_by_id() {
     local realm_id="$1"
@@ -1469,25 +1621,37 @@ function build_syslog_message() {
 }
 
 # userId로부터 username을 추출하는 함수
-# 우선순위: username > userId > code_id
+# 우선순위: details.username > userId(json) > userId(api) > code_id(json) > userId
 function get_username_from_event() {
     local event="$1"
     local access_token="$2"
-    local json_file="$3"  # 전체 이벤트 파일 경로 (code_id 검색용)
+    local json_file="$3"  # 전체 이벤트 파일 경로 (검색용)
     
     # 1. details.username 확인 (최우선)
     local username=$(echo "$event" | jq -r '.details.username // empty')
-    
     if [ -n "$username" ] && [ "$username" != "null" ]; then
         echo "$username"
         return 0
     fi
     
-    # 2. userId로 Admin API 호출
     local user_id=$(echo "$event" | jq -r '.userId // empty')
     
+    # 2. userId로 현재 JSON 파일에서 다른 이벤트 검색
+    if [ -n "$user_id" ] && [ "$user_id" != "null" ] && [ -f "$json_file" ]; then
+        username=$(jq -r --arg user_id "$user_id" '
+            .[] |
+            select(.userId == $user_id and .details.username != null and .details.username != "") |
+            .details.username
+        ' "$json_file" 2>/dev/null | head -1)
+        
+        if [ -n "$username" ] && [ "$username" != "null" ]; then
+            echo "$username"
+            return 0
+        fi
+    fi
+    
+    # 3. userId로 Admin API 호출 (파일에서 못 찾은 경우)
     if [ -n "$user_id" ] && [ "$user_id" != "null" ]; then
-        # Admin API로 사용자 정보 조회
         if [ -n "$access_token" ]; then
             local user_info=$(curl -s -X GET \
                 "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}" \
@@ -1495,29 +1659,22 @@ function get_username_from_event() {
             
             if [ $? -eq 0 ] && echo "$user_info" | jq -e . >/dev/null 2>&1; then
                 username=$(echo "$user_info" | jq -r '.username // empty')
-                
                 if [ -n "$username" ] && [ "$username" != "null" ]; then
                     echo "$username"
                     return 0
                 fi
             fi
         fi
-        
-        # API 호출 실패 시 userId 그대로 반환
-        echo "$user_id"
-        return 0
     fi
     
-    # 3. code_id로 같은 세션의 성공한 이벤트에서 username 찾기
+    # 4. code_id로 같은 세션의 성공한 이벤트에서 username 찾기
     local code_id=$(echo "$event" | jq -r '.details.code_id // empty')
-    
     if [ -n "$code_id" ] && [ "$code_id" != "null" ] && [ -f "$json_file" ]; then
-        # 같은 code_id를 가진 성공한 이벤트에서 username 추출
         local related_username=$(jq -r --arg code_id "$code_id" '
-            .[] | 
-            select(.details.code_id == $code_id and .userId != null) | 
-            .details.username // empty
-        ' "$json_file" 2>/dev/null | grep -v '^$' | head -1)
+            .[] |
+            select(.details.code_id == $code_id and .userId != null and .details.username != null and .details.username != "") |
+            .details.username
+        ' "$json_file" 2>/dev/null | head -1)
         
         if [ -n "$related_username" ]; then
             echo "$related_username"
@@ -1525,7 +1682,13 @@ function get_username_from_event() {
         fi
     fi
     
-    # 4. 모든 방법 실패 시
+    # 5. 모든 방법으로 username을 찾지 못한 경우, userId라도 반환
+    if [ -n "$user_id" ] && [ "$user_id" != "null" ]; then
+        echo "$user_id"
+        return 0
+    fi
+    
+    # 6. 모든 방법 실패 시
     echo "unknown"
     return 0
 }
@@ -1708,6 +1871,9 @@ function handle_send_events_to_syslog() {
     
     # Keycloak 토큰 발급 (username 조회용)
     echo "Keycloak 토큰 발급 중..."
+    echo "Keycloak 서버: $KEYCLOAK_URL"
+    echo "렐름: $REALM"
+    
     local access_token=$(get_keycloak_token)
     if [ $? -ne 0 ]; then
         echo "경고: 토큰 발급 실패. username 조회가 제한될 수 있습니다." >&2
@@ -1779,7 +1945,9 @@ function handle_send_events_to_syslog() {
         fi
         
         # API 호출 간격 (과부하 방지)
-        sleep 0.01
+        # keycloak event 다운로드시에 event api 호출 간격을 1초로 설정하였음. 이를 참조하여 동일하게 적용함.
+        # sleep "$EVENT_API_SLEEP_INTERVAL"
+        sleep 0.1
     done < <(jq -c '.[]' "$json_file")
     
     echo ""
@@ -1879,10 +2047,15 @@ function cmd_help()
     echo "  show_events_state                    # 이벤트 상태 정보 표시"
     echo "  send_user_events_syslog <file.json>  # 사용자 이벤트를 Syslog로 전송"
     echo "  send_admin_events_syslog <file.json> # 관리자 이벤트를 Syslog로 전송"
+    echo "  filter_user_events <source.json> <start|*> <end|*> [output.json]"
+    echo "                                           # 사용자 이벤트 JSON을 시간 범위로 필터링 (시작 포함, 종료 제외)"
+    echo "                                           # '*' 입력 시 해당 구간은 무제한으로 처리"
+    echo "                                           # 예시: \"2025-11-11 16:50:17\" \"2025-11-11 16:59:00\""
+    echo "  epoch_to_datetime <epoch_ms>         # epoch(밀리초/초)을 YYYY-MM-DD HH:MM:SS로 변환"
     echo "  send_syslog <sessions.json>          # 세션 정보를 Syslog로 전송"
     echo "  download_auth_flow [flow]            # 인증 플로우(browser 등) 다운로드"
     echo "  get_token                            # 토큰 발급 및 정보 표시"
-    echo "  refresh_token [refresh_token]         # Refresh token으로 토큰 갱신"
+    echo "  refresh_token [refresh_token]        # Refresh token으로 토큰 갱신"
     echo "  token_info [access_token]            # 토큰 정보 확인 (만료 시간, 권한 등)"
     echo "  help                                 # 도움말 표시"
 }
@@ -2051,6 +2224,37 @@ function cmd_send_admin_events_syslog()
     handle_send_events_to_syslog "$json_file" "admin"
 }
 
+function cmd_filter_user_events()
+{
+    load_config || return 1
+
+    if [ $# -lt 3 ]; then
+        echo "사용법: $0 filter_user_events <input_file> <start_datetime|*> <end_datetime|*> [output_file]" >&2
+        echo "예시:  $0 filter_user_events ./events/user_events.json \"2025-11-11 16:50:17\" \"2025-11-11 16:59:00\"" >&2
+        echo "       $0 filter_user_events ./events/user_events.json \"2025-11-11 16:50:17\" \"*\"" >&2
+        echo "       $0 filter_user_events ./events/user_events.json \"*\" \"2025-11-17 09:00:00\"" >&2
+        return 1
+    fi
+
+    local input_file="$1"
+    local start_datetime="$2"
+    local end_datetime="$3"
+    local output_file="${4:-}"
+
+    if [ ! -f "$input_file" ]; then
+        echo "오류: 입력 파일이 존재하지 않습니다: $input_file" >&2
+        return 1
+    fi
+
+    if [ -z "$output_file" ]; then
+        local events_dir="${SCRIPT_DIR}/events"
+        mkdir -p "$events_dir"
+        output_file="${events_dir}/user_events_filtered-$(date +%Y.%m.%d_%H.%M.%S).json"
+    fi
+
+    filter_user_events_by_time_range "$input_file" "$output_file" "$start_datetime" "$end_datetime"
+}
+
 function cmd_get_token()
 {
     load_config || return 1
@@ -2213,6 +2417,37 @@ function cmd_token_info()
     
     display_token_info "$token"
     
+    return 0
+}
+
+function cmd_epoch_to_datetime()
+{
+    if [ $# -eq 0 ]; then
+        echo "사용법: $0 epoch_to_datetime <epoch_ms_or_s>" >&2
+        echo "예시:  $0 epoch_to_datetime 1762846449897" >&2
+        return 1
+    fi
+
+    if [ $# -gt 1 ]; then
+        echo "오류: 인자는 하나의 epoch 값만 허용됩니다." >&2
+        echo "사용법: $0 epoch_to_datetime <epoch_ms_or_s>" >&2
+        return 1
+    fi
+
+    local epoch_value="$1"
+    if ! [[ "$epoch_value" =~ ^[0-9]+$ ]]; then
+        echo "오류: 숫자 형식의 epoch 값을 입력하세요." >&2
+        return 1
+    fi
+
+    local formatted
+    formatted=$(epoch_to_datetime "$epoch_value")
+    if [ -z "$formatted" ]; then
+        echo "오류: epoch 값을 변환할 수 없습니다." >&2
+        return 1
+    fi
+
+    echo "$formatted"
     return 0
 }
 
