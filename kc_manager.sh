@@ -47,6 +47,13 @@ USER_EVENTS_STATE_FILE=""
 ADMIN_EVENTS_STATE_FILE=""
 EVENT_LOCK_FILE=""
 
+# GeoIP 데이터베이스 경로 (필요 시 심볼릭 링크 권장)
+GEOIP_BASE_DIR="${SCRIPT_DIR}/geolite"
+GEOIP_CITY_DB="${GEOIP_BASE_DIR}/GeoLite2-City_20251114/GeoLite2-City.mmdb"
+GEOIP_COUNTRY_DB="${GEOIP_BASE_DIR}/GeoLite2-Country_20251114/GeoLite2-Country.mmdb"
+declare -A GEOIP_CACHE=()
+MMDBLOOKUP_BIN=""
+
 # epoch(ms 또는 s) → YYYY-MM-DD HH:MM:SS 변환 함수
 function epoch_to_datetime() {
     local epoch_value="$1"
@@ -324,6 +331,35 @@ function should_exclude_user() {
     return 1
 }
 
+# 파일 크기를 사람이 읽기 쉬운 단위로 변환
+function format_file_size() {
+    local size_bytes="$1"
+
+    if [ -z "$size_bytes" ] || ! [[ "$size_bytes" =~ ^[0-9]+$ ]]; then
+        echo "0 bytes"
+        return 1
+    fi
+
+    local size_kb=$((size_bytes / 1024))
+    local size_mb=$((size_bytes / 1048576))
+    local size_gb=$((size_bytes / 1073741824))
+
+    if [ "$size_gb" -gt 0 ]; then
+        local remainder=$(( (size_bytes % 1073741824) * 100 / 1073741824 ))
+        printf "%d.%02d GB (%s bytes)\n" "$size_gb" "$remainder" "$size_bytes"
+    elif [ "$size_mb" -gt 0 ]; then
+        local remainder=$(( (size_bytes % 1048576) * 100 / 1048576 ))
+        printf "%d.%02d MB (%s bytes)\n" "$size_mb" "$remainder" "$size_bytes"
+    elif [ "$size_kb" -gt 0 ]; then
+        local remainder=$(( (size_bytes % 1024) * 100 / 1024 ))
+        printf "%d.%02d KB (%s bytes)\n" "$size_kb" "$remainder" "$size_bytes"
+    else
+        echo "${size_bytes} bytes"
+    fi
+
+    return 0
+}
+
 # 파일 존재 및 크기 검증 함수
 function validate_file() {
     local file_path="$1"
@@ -340,6 +376,151 @@ function validate_file() {
         return 1
     fi
     
+    return 0
+}
+
+# 사설/예약 IP 여부 확인
+function is_private_ip() {
+    local ip="$1"
+
+    if [ -z "$ip" ]; then
+        return 0
+    fi
+
+    if [[ "$ip" =~ ^10\. ]] ||
+       [[ "$ip" =~ ^192\.168\. ]] ||
+       [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] ||
+       [[ "$ip" =~ ^127\. ]] ||
+       [[ "$ip" =~ ^169\.254\. ]] ||
+       [[ "$ip" =~ ^::1$ ]] ||
+       [[ "$ip" =~ ^fe80: ]] ||
+       [[ "$ip" =~ ^fc00: ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# mmdblookup 바이너리 확인
+function ensure_mmdblookup() {
+    if [ -n "$MMDBLOOKUP_BIN" ]; then
+        return 0
+    fi
+
+    MMDBLOOKUP_BIN=$(command -v mmdblookup || true)
+    if [ -z "$MMDBLOOKUP_BIN" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+# mmdblookup으로 특정 필드를 조회
+function lookup_geoip_value() {
+    local ip="$1"
+    local db_file="$2"
+    shift 2
+    local field_path=("$@")
+
+    if [ -z "$ip" ] || [ -z "$db_file" ] || [ ! -f "$db_file" ]; then
+        return 1
+    fi
+
+    if ! ensure_mmdblookup; then
+        return 1
+    fi
+
+    local output
+    output=$("$MMDBLOOKUP_BIN" --file "$db_file" --ip "$ip" "${field_path[@]}" 2>/dev/null) || return 1
+
+    local string_value
+    string_value=$(echo "$output" | grep -oP '"\K[^"]+(?="\s*<utf8_string>)' | head -1)
+    if [ -n "$string_value" ]; then
+        echo "$string_value"
+        return 0
+    fi
+
+    local number_value
+    number_value=$(echo "$output" | grep -oP '[-]?[0-9]+(\.[0-9]+)?(?=\s*<(double|float|uint[0-9]+|int[0-9]+)>)' | head -1)
+    if [ -n "$number_value" ]; then
+        echo "$number_value"
+        return 0
+    fi
+
+    return 1
+}
+
+# GeoIP 정보 조회 및 캐시
+function get_geoip_info() {
+    local ip="$1"
+
+    if [ -z "$ip" ] || [ "$ip" = "unknown" ] || [ "$ip" = "null" ]; then
+        return 1
+    fi
+
+    if is_private_ip "$ip"; then
+        return 1
+    fi
+
+    if [ -n "${GEOIP_CACHE[$ip]+_}" ]; then
+        echo "${GEOIP_CACHE[$ip]}"
+        return 0
+    fi
+
+    if [ ! -f "$GEOIP_CITY_DB" ] && [ ! -f "$GEOIP_COUNTRY_DB" ]; then
+        return 1
+    fi
+
+    if ! ensure_mmdblookup; then
+        return 1
+    fi
+
+    local country_code=""
+    local country_name=""
+    local city_name=""
+    local latitude=""
+    local longitude=""
+
+    if [ -f "$GEOIP_COUNTRY_DB" ]; then
+        country_code=$(lookup_geoip_value "$ip" "$GEOIP_COUNTRY_DB" country iso_code || true)
+        country_name=$(lookup_geoip_value "$ip" "$GEOIP_COUNTRY_DB" country names en || true)
+    fi
+
+    if [ -f "$GEOIP_CITY_DB" ]; then
+        city_name=$(lookup_geoip_value "$ip" "$GEOIP_CITY_DB" city names en || true)
+        latitude=$(lookup_geoip_value "$ip" "$GEOIP_CITY_DB" location latitude || true)
+        longitude=$(lookup_geoip_value "$ip" "$GEOIP_CITY_DB" location longitude || true)
+
+        if [ -z "$country_code" ]; then
+            country_code=$(lookup_geoip_value "$ip" "$GEOIP_CITY_DB" country iso_code || true)
+        fi
+        if [ -z "$country_name" ]; then
+            country_name=$(lookup_geoip_value "$ip" "$GEOIP_CITY_DB" country names en || true)
+        fi
+    fi
+
+    if [ -z "$country_code" ] && [ -z "$country_name" ] && [ -z "$city_name" ] && [ -z "$latitude" ] && [ -z "$longitude" ]; then
+        return 1
+    fi
+
+    local geo_json
+    geo_json=$(jq -n -c \
+        --arg ip "$ip" \
+        --arg cc "$country_code" \
+        --arg cn "$country_name" \
+        --arg city "$city_name" \
+        --arg lat "$latitude" \
+        --arg lon "$longitude" '
+        ({} 
+        | (if $ip != "" then .ip = $ip else . end)
+        | (if $cc != "" then .country_code = $cc else . end)
+        | (if $cn != "" then .country_name = $cn else . end)
+        | (if $city != "" then .city = $city else . end)
+        | (if ($lat != "" and $lon != "") then .location = {lat: ($lat | tonumber), lon: ($lon | tonumber)} else . end)
+        )')
+
+    GEOIP_CACHE["$ip"]="$geo_json"
+    echo "$geo_json"
     return 0
 }
 
@@ -527,7 +708,8 @@ function upload_to_elasticsearch() {
     fi
     
     local file_size=$(stat -c%s "$bulk_file" 2>/dev/null || echo "0")
-    echo "bulk 파일 크기: $file_size bytes"
+    local formatted_size=$(format_file_size "$file_size")
+    echo "bulk 파일 크기: $formatted_size"
     echo "Elasticsearch로 데이터를 전송합니다..."
     
     local http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${ELASTICSEARCH_URL}/_bulk" \
@@ -564,6 +746,150 @@ function convert_json_to_bulk() {
         echo "$line" >> "$bulk_file"
     done
     
+    return 0
+}
+
+# 대용량 JSON 배열을 스트리밍으로 한 줄씩 출력
+function stream_json_array_items() {
+    local json_file="$1"
+
+    if [ -z "$json_file" ] || [ ! -f "$json_file" ]; then
+        echo "오류: JSON 파일이 존재하지 않습니다: $json_file" >&2
+        return 1
+    fi
+
+    jq -c '.[]' "$json_file"
+}
+
+# GeoIP 캐시 사전 구축 함수
+function prebuild_geoip_cache() {
+    local json_file="$1"
+    
+    echo "IP 주소 추출 중..."
+    local unique_ips=$(jq -r '[.[].ipAddress // empty] | unique | .[]' "$json_file" 2>/dev/null)
+    
+    if [ -z "$unique_ips" ]; then
+        echo "  IP 주소 없음"
+        return 0
+    fi
+    
+    local ip_count=$(echo "$unique_ips" | wc -l)
+    echo "유니크 IP: ${ip_count}개"
+    echo "GeoIP 정보 캐시 구축 중..."
+    
+    local cached=0
+    local cache_success=0
+    while IFS= read -r ip; do
+        if [ -n "$ip" ] && [ "$ip" != "null" ]; then
+            cached=$((cached + 1))
+            if get_geoip_info "$ip" >/dev/null 2>&1; then
+                cache_success=$((cache_success + 1))
+            fi
+            if [ $((cached % 10)) -eq 0 ]; then
+                printf "\r  GeoIP 캐시: %d/%d건 처리" "$cached" "$ip_count"
+            fi
+        fi
+    done <<< "$unique_ips"
+    
+    if [ $cached -gt 0 ]; then
+        printf "\r  GeoIP 캐시: %d/%d건 완료 (성공: %d건)\n" "$cached" "$ip_count" "$cache_success"
+    fi
+    
+    return 0
+}
+
+# 이벤트 JSON을 NDJSON으로 변환 (GeoIP 포함)
+function convert_events_json_to_ndjson() {
+    local json_file="$1"
+    local bulk_file="$2"
+    local index_name="$3"
+    local id_field="${4:-id}"
+    local progress_interval=500
+
+    if ! validate_file "$json_file" "이벤트 JSON"; then
+        return 1
+    fi
+
+    if ! jq -e . >/dev/null 2>&1 < "$json_file"; then
+        echo "오류: 잘못된 JSON 형식입니다: $json_file" >&2
+        return 1
+    fi
+
+    local event_count=$(jq 'length' "$json_file" 2>/dev/null || echo "0")
+    if [ "$event_count" -eq 0 ]; then
+        echo "경고: JSON 파일에 이벤트가 없습니다." >&2
+        return 1
+    fi
+
+    prebuild_geoip_cache "$json_file"
+
+    > "$bulk_file"
+    echo "이벤트 JSON을 NDJSON 형식으로 변환 중... (총 ${event_count}개)"
+
+    local convert_failed=0
+    local processed=0
+    local geoip_attempts=0
+    local geoip_success=0
+    local geoip_cache_hit=0
+    local last_progress=0
+
+    while IFS= read -r line; do
+        local doc_id=$(echo "$line" | jq -r ".${id_field} // empty")
+        if [ -z "$doc_id" ] || [ "$doc_id" = "null" ]; then
+            doc_id=$(echo "$line" | jq -r '.id // empty')
+        fi
+        if [ -z "$doc_id" ] || [ "$doc_id" = "null" ]; then
+            doc_id="$(date +%s%3N)-$processed"
+        fi
+
+        local ip_address=$(echo "$line" | jq -r '.ipAddress // empty')
+        if [ -n "$ip_address" ] && [ "$ip_address" != "null" ]; then
+            geoip_attempts=$((geoip_attempts + 1))
+            if [ -n "${GEOIP_CACHE[$ip_address]+_}" ]; then
+                geoip_cache_hit=$((geoip_cache_hit + 1))
+                local geoip_json="${GEOIP_CACHE[$ip_address]}"
+                if [ -n "$geoip_json" ]; then
+                    line=$(echo "$line" | jq -c --argjson geo "$geoip_json" '. + {geoip: $geo}')
+                    geoip_success=$((geoip_success + 1))
+                fi
+            fi
+        fi
+
+        echo "{\"index\": {\"_index\": \"$index_name\", \"_id\": \"$doc_id\"}}" >> "$bulk_file"
+        echo "$line" >> "$bulk_file"
+        processed=$((processed + 1))
+
+        if [ $progress_interval -gt 0 ] && [ $((processed % progress_interval)) -eq 0 ]; then
+            local progress_pct=$((processed * 100 / event_count))
+            printf "\r  진행: %d/%d건 (%d%%)" "$processed" "$event_count" "$progress_pct"
+            last_progress=$processed
+        fi
+    done < <(stream_json_array_items "$json_file") || convert_failed=1
+
+    if [ $last_progress -lt $processed ]; then
+        printf "\r  진행: %d/%d건 (100%%)\n" "$processed" "$event_count"
+    else
+        echo ""
+    fi
+
+    if [ $convert_failed -ne 0 ]; then
+        echo "오류: NDJSON 변환 중 문제가 발생했습니다." >&2
+        # rm -f "$bulk_file"
+        return 1
+    fi
+
+    local bulk_size=$(stat -c%s "$bulk_file" 2>/dev/null || echo "0")
+    if [ "$bulk_size" -eq 0 ]; then
+        echo "오류: 변환된 bulk 파일이 비어 있습니다." >&2
+        # rm -f "$bulk_file"
+        return 1
+    fi
+
+    local formatted_size=$(format_file_size "$bulk_size")
+    echo "변환 완료: bulk 파일 크기 $formatted_size"
+    if [ $geoip_attempts -gt 0 ]; then
+        echo "GeoIP 처리: ${geoip_success}/${geoip_attempts}건 성공 (캐시 히트: ${geoip_cache_hit}건)"
+    fi
     return 0
 }
 
@@ -633,6 +959,69 @@ function handle_upload_sessions() {
     
     rm -f "$bulk_file"
     return $result
+}
+
+# 이벤트 파일 업로드 처리
+function handle_upload_events() {
+    local events_file="$1"
+    local index_name="${2:-}"
+    local event_type="${3:-user}"
+
+    if [ -z "$events_file" ]; then
+        echo "오류: 이벤트 파일 경로를 지정해주세요." >&2
+        echo "사용법: $0 upload_${event_type}_events <events.json> [index_name]" >&2
+        return 1
+    fi
+
+    if ! validate_file "$events_file" "이벤트 파일"; then
+        return 1
+    fi
+
+    if [ -z "$index_name" ]; then
+        local file_basename
+        file_basename=$(basename "$events_file")
+        index_name="${file_basename%.json}"
+        if [ "$index_name" = "$file_basename" ]; then
+            index_name="${file_basename%.JSON}"
+        fi
+        if [ "$index_name" = "$file_basename" ]; then
+            if [ "$event_type" = "user" ]; then
+                index_name="keycloak-user-events-$(date +%Y.%m.%d)"
+            else
+                index_name="keycloak-admin-events-$(date +%Y.%m.%d)"
+            fi
+        fi
+    fi
+
+    echo "=== 이벤트 파일 Elasticsearch 업로드 ==="
+    echo "파일: $events_file"
+    echo "인덱스: $index_name"
+
+    local bulk_file
+    bulk_file=$(mktemp "/tmp/kc_events_bulk_XXXXXX.ndjson")
+    echo "bulk 파일: $bulk_file"
+    
+    if [ -z "$bulk_file" ]; then
+        echo "오류: 임시 파일을 생성할 수 없습니다." >&2
+        return 1
+    fi
+
+    if ! convert_events_json_to_ndjson "$events_file" "$bulk_file" "$index_name" "id"; then
+        rm -f "$bulk_file"
+        return 1
+    fi
+
+    local upload_result=0
+    upload_to_elasticsearch "$bulk_file" "$index_name" || upload_result=$?
+
+    # rm -f "$bulk_file"
+
+    if [ $upload_result -eq 0 ]; then
+        echo "업로드 완료"
+        return 0
+    fi
+
+    return 1
 }
 
 # 사용자 그룹 정보 조회 함수
@@ -2032,34 +2421,6 @@ function handle_download_auth_flow() {
     fi
 }
 
-
-function cmd_help()
-{
-    echo "Usage: $0 [command] [options]"
-    echo ""
-    echo "  collect_all [--include-excluded]            # 전체 프로세스 실행 (수집 + ES 업로드)"
-    echo "  upload_only [bulk_file]                     # 지정 bulk 파일을 ES로 업로드"
-    echo "  upload_sessions <sessions.json>             # 세션 JSON을 ES로 업로드"
-    echo "  download_groups [out.json] [--include-excluded]   # 사용자 그룹 정보 다운로드"
-    echo "  download_sessions [out.json] [--include-excluded] # 사용자 세션 정보 다운로드"
-    echo "  download_user_events [out.json]      # 사용자 이벤트 다운로드 (증분)"
-    echo "  download_admin_events [out.json]     # 관리자 이벤트 다운로드 (증분)"
-    echo "  show_events_state                    # 이벤트 상태 정보 표시"
-    echo "  send_user_events_syslog <file.json>  # 사용자 이벤트를 Syslog로 전송"
-    echo "  send_admin_events_syslog <file.json> # 관리자 이벤트를 Syslog로 전송"
-    echo "  filter_user_events <source.json> <start|*> <end|*> [output.json]"
-    echo "                                           # 사용자 이벤트 JSON을 시간 범위로 필터링 (시작 포함, 종료 제외)"
-    echo "                                           # '*' 입력 시 해당 구간은 무제한으로 처리"
-    echo "                                           # 예시: \"2025-11-11 16:50:17\" \"2025-11-11 16:59:00\""
-    echo "  epoch_to_datetime <epoch_ms>         # epoch(밀리초/초)을 YYYY-MM-DD HH:MM:SS로 변환"
-    echo "  send_syslog <sessions.json>          # 세션 정보를 Syslog로 전송"
-    echo "  download_auth_flow [flow]            # 인증 플로우(browser 등) 다운로드"
-    echo "  get_token                            # 토큰 발급 및 정보 표시"
-    echo "  refresh_token [refresh_token]        # Refresh token으로 토큰 갱신"
-    echo "  token_info [access_token]            # 토큰 정보 확인 (만료 시간, 권한 등)"
-    echo "  help                                 # 도움말 표시"
-}
-
 # 하위 명령 구현
 function cmd_collect_all()
 {
@@ -2096,6 +2457,22 @@ function cmd_upload_sessions()
     load_config || return 1
     local sessions_file="$1"
     handle_upload_sessions "$sessions_file"
+}
+
+function cmd_upload_user_events()
+{
+    load_config || return 1
+    local events_file="$1"
+    local index_name="$2"
+    handle_upload_events "$events_file" "$index_name" "user"
+}
+
+function cmd_upload_admin_events()
+{
+    load_config || return 1
+    local events_file="$1"
+    local index_name="$2"
+    handle_upload_events "$events_file" "$index_name" "admin"
 }
 
 function cmd_download_groups()
@@ -2253,6 +2630,65 @@ function cmd_filter_user_events()
     fi
 
     filter_user_events_by_time_range "$input_file" "$output_file" "$start_datetime" "$end_datetime"
+}
+
+function cmd_convert_events_ndjson()
+{
+    load_config || return 1
+
+    if [ -z "$1" ]; then
+        echo "사용법: $0 convert_events_ndjson <input.json> [output.ndjson] [index_name] [user|admin]" >&2
+        return 1
+    fi
+
+    local input_file="$1"
+    local output_file="$2"
+    local index_name="$3"
+    local event_type="${4:-user}"
+
+    if [ ! -f "$input_file" ]; then
+        echo "오류: 입력 파일이 존재하지 않습니다: $input_file" >&2
+        return 1
+    fi
+
+    local events_dir="${SCRIPT_DIR}/events"
+    mkdir -p "$events_dir"
+
+    if [ -z "$output_file" ]; then
+        local base_name
+        base_name=$(basename "$input_file")
+        local prefix="${base_name%.*}"
+        local timestamp
+        timestamp=$(date +%Y.%m.%d_%H.%M.%S)
+        if [ -z "$prefix" ] || [ "$prefix" = "$base_name" ]; then
+            prefix="${event_type}_events"
+        fi
+        output_file="${events_dir}/${prefix}_${timestamp}.ndjson"
+    fi
+
+    if [ -z "$index_name" ]; then
+        local base_output
+        base_output=$(basename "$output_file")
+        index_name="${base_output%.ndjson}"
+        if [ -z "$index_name" ] || [ "$index_name" = "$base_output" ]; then
+            if [ "$event_type" = "admin" ]; then
+                index_name="keycloak-admin-events-$(date +%Y.%m.%d)"
+            else
+                index_name="keycloak-user-events-$(date +%Y.%m.%d)"
+            fi
+        fi
+    fi
+
+    echo "입력 파일: $input_file"
+    echo "출력 파일: $output_file"
+    echo "인덱스명: $index_name"
+
+    if convert_events_json_to_ndjson "$input_file" "$output_file" "$index_name" "id"; then
+        echo "NDJSON 변환 완료: $output_file"
+        return 0
+    fi
+
+    return 1
 }
 
 function cmd_get_token()
@@ -2449,6 +2885,37 @@ function cmd_epoch_to_datetime()
 
     echo "$formatted"
     return 0
+}
+
+function cmd_help()
+{
+    echo "Usage: $0 [command] [options]"
+    echo ""
+    echo "  collect_all [--include-excluded]            # 전체 프로세스 실행 (수집 + ES 업로드)"
+    echo "  upload_only [bulk_file]                     # 지정 bulk 파일을 ES로 업로드"
+    echo "  upload_sessions <sessions.json>             # 세션 JSON을 ES로 업로드"
+    echo "  upload_user_events <file.json> [index]      # 사용자 이벤트 JSON → NDJSON 후 ES 업로드"
+    echo "  upload_admin_events <file.json> [index]     # 관리자 이벤트 JSON → NDJSON 후 ES 업로드"
+    echo "  download_groups [out.json] [--include-excluded]   # 사용자 그룹 정보 다운로드"
+    echo "  download_sessions [out.json] [--include-excluded] # 사용자 세션 정보 다운로드"
+    echo "  download_user_events [out.json]      # 사용자 이벤트 다운로드 (증분)"
+    echo "  download_admin_events [out.json]     # 관리자 이벤트 다운로드 (증분)"
+    echo "  show_events_state                    # 이벤트 상태 정보 표시"
+    echo "  send_user_events_syslog <file.json>  # 사용자 이벤트를 Syslog로 전송"
+    echo "  send_admin_events_syslog <file.json> # 관리자 이벤트를 Syslog로 전송"
+    echo "  convert_events_ndjson <input.json> [output.ndjson] [index] [user|admin]"
+    echo "                                           # 이벤트 JSON을 GeoIP 포함 NDJSON으로 변환"
+    echo "  filter_user_events <source.json> <start|*> <end|*> [output.json]"
+    echo "                                           # 사용자 이벤트 JSON을 시간 범위로 필터링 (시작 포함, 종료 제외)"
+    echo "                                           # '*' 입력 시 해당 구간은 무제한으로 처리"
+    echo "                                           # 예시: \"2025-11-11 16:50:17\" \"2025-11-11 16:59:00\""
+    echo "  epoch_to_datetime <epoch_ms>         # epoch(밀리초/초)을 YYYY-MM-DD HH:MM:SS로 변환"
+    echo "  send_syslog <sessions.json>          # 세션 정보를 Syslog로 전송"
+    echo "  download_auth_flow [flow]            # 인증 플로우(browser 등) 다운로드"
+    echo "  get_token                            # 토큰 발급 및 정보 표시"
+    echo "  refresh_token [refresh_token]        # Refresh token으로 토큰 갱신"
+    echo "  token_info [access_token]            # 토큰 정보 확인 (만료 시간, 권한 등)"
+    echo "  help                                 # 도움말 표시"
 }
 
 function cmd_()
