@@ -29,6 +29,7 @@ SERVICE_ACCOUNT_CLIENT_SECRET=""
 ELASTICSEARCH_URL=""
 ES_INDEX_NAME=""
 ES_BULK_FILE=""
+CURL_OPT_INSECURE=""
 
 # 이벤트 API 호출 간격 (초) - 기본값 1초
 EVENT_API_SLEEP_INTERVAL=1
@@ -139,6 +140,13 @@ function load_config() {
     ADMIN_EVENTS_STATE_FILE="${EVENT_STATE_DIR}/keycloak_admin_events_${REALM}.state"
     USER_EVENT_LOCK_FILE="${EVENT_STATE_DIR}/keycloak_user_events_download_${REALM}.lock"
     ADMIN_EVENT_LOCK_FILE="${EVENT_STATE_DIR}/keycloak_admin_events_download_${REALM}.lock"
+    
+    # SSL 인증서 검증 생략 여부 설정
+    if [ "$KC_INSECURE" = "true" ]; then
+        CURL_OPT_INSECURE="-k"
+    else
+        CURL_OPT_INSECURE=""
+    fi
  
     # 필수 설정 확인
     if [ -z "$ELASTICSEARCH_URL" ]; then
@@ -152,7 +160,7 @@ function load_config() {
 # Keycloak 서비스 계정 토큰 발급 함수
 function get_keycloak_token() {
     local token
-    token=$(curl -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
+    token=$(curl $CURL_OPT_INSECURE -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -d "grant_type=client_credentials" \
         -d "client_id=${SERVICE_ACCOUNT_CLIENT_ID}" \
@@ -170,7 +178,7 @@ function get_keycloak_token() {
 # Keycloak 서비스 계정 토큰 응답 전체를 반환하는 함수
 function get_token_response() {
     local response
-    response=$(curl -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
+    response=$(curl $CURL_OPT_INSECURE -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -d "grant_type=client_credentials" \
         -d "client_id=${SERVICE_ACCOUNT_CLIENT_ID}" \
@@ -716,7 +724,7 @@ function upload_to_elasticsearch() {
     echo "bulk 파일 크기: $formatted_size"
     echo "Elasticsearch로 데이터를 전송합니다..."
     
-    local http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${ELASTICSEARCH_URL}/_bulk" \
+    local http_code=$(curl $CURL_OPT_INSECURE -s -o /dev/null -w "%{http_code}" -X POST "${ELASTICSEARCH_URL}/_bulk" \
         -H "Content-Type: application/x-ndjson" \
         --data-binary "@${bulk_file}")
     
@@ -1033,7 +1041,7 @@ function get_user_groups() {
     local user_id="$1"
     local access_token="$2"
     
-    local groups_raw=$(curl -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}/groups" \
+    local groups_raw=$(curl $CURL_OPT_INSECURE -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}/groups" \
         -H "Authorization: Bearer ${access_token}")
     
     echo "$groups_raw" | jq -c '[.[] | {id: .id, name: .name, path: .path}] // []'
@@ -1069,7 +1077,7 @@ function handle_download_groups() {
     echo "토큰 발급 성공!"
     
     echo "Realm의 모든 사용자 정보 조회 중..."
-    local users_info=$(curl -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users?max=1000&briefRepresentation=false" \
+    local users_info=$(curl $CURL_OPT_INSECURE -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users?max=1000&briefRepresentation=false" \
         -H "Authorization: Bearer ${access_token}")
     
     local user_count=$(echo "$users_info" | jq '. | length')
@@ -1096,7 +1104,7 @@ function handle_download_groups() {
         
         echo "진행 상황: $((i + 1))/${user_count} - 사용자: $username"
         
-        local groups_raw=$(curl -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}/groups" \
+        local groups_raw=$(curl $CURL_OPT_INSECURE -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}/groups" \
             -H "Authorization: Bearer ${access_token}")
         local user_groups=$(get_user_groups "$user_id" "$access_token")
         local primary_group=$(extract_primary_group "$groups_raw")
@@ -1160,7 +1168,7 @@ function get_user_sessions() {
     local user_id="$1"
     local access_token="$2"
     
-    local sessions_raw=$(curl -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}/sessions" \
+    local sessions_raw=$(curl $CURL_OPT_INSECURE -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}/sessions" \
         -H "Authorization: Bearer ${access_token}")
     
     echo "$sessions_raw" | jq -c '. // []'
@@ -1183,7 +1191,7 @@ function handle_download_sessions() {
     echo "토큰 발급 성공!"
     
     echo "Realm의 모든 사용자 정보 조회 중..."
-    local users_info=$(curl -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users?max=1000&briefRepresentation=false" \
+    local users_info=$(curl $CURL_OPT_INSECURE -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users?max=1000&briefRepresentation=false" \
         -H "Authorization: Bearer ${access_token}")
     
     local user_count=$(echo "$users_info" | jq '. | length')
@@ -1280,7 +1288,7 @@ function get_user_credentials() {
     local user_id="$1"
     local access_token="$2"
     
-    local credentials_raw=$(curl -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}/credentials" \
+    local credentials_raw=$(curl $CURL_OPT_INSECURE -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}/credentials" \
         -H "Authorization: Bearer ${access_token}")
     
     echo "$credentials_raw" | jq -c '. // []'
@@ -1365,7 +1373,7 @@ function collect_all_user_stats() {
     echo "토큰 발급 성공!"
     
     echo "Realm의 모든 사용자 상세 정보 조회 중..."
-    local users_info=$(curl -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users?max=1000&briefRepresentation=false" \
+    local users_info=$(curl $CURL_OPT_INSECURE -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users?max=1000&briefRepresentation=false" \
         -H "Authorization: Bearer ${access_token}")
     
     local user_count=$(echo "$users_info" | jq '. | length')
@@ -1403,7 +1411,7 @@ function collect_all_user_stats() {
                 local credentials_raw=$(get_user_credentials "$user_id" "$access_token")
                 credentials="$credentials_raw"
                 
-                local user_groups_raw=$(curl -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}/groups" \
+                local user_groups_raw=$(curl $CURL_OPT_INSECURE -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}/groups" \
                     -H "Authorization: Bearer ${access_token}")
                 user_groups=$(echo "$user_groups_raw" | jq -c '[.[] | .path] // []')
             fi
@@ -1591,7 +1599,7 @@ function handle_download_user_events() {
         
         # API 호출
         local events
-        events=$(curl -s -X GET \
+        events=$(curl $CURL_OPT_INSECURE -s -X GET \
             "${KEYCLOAK_URL}/admin/realms/${REALM}/events?first=${first}&max=${max}&dateFrom=${last_time}" \
             -H "Authorization: Bearer ${access_token}")
         
@@ -1746,7 +1754,7 @@ function handle_download_admin_events() {
         
         # API 호출 (admin-events 엔드포인트 사용)
         local events
-        events=$(curl -s -X GET \
+        events=$(curl $CURL_OPT_INSECURE -s -X GET \
             "${KEYCLOAK_URL}/admin/realms/${REALM}/admin-events?first=${first}&max=${max}&dateFrom=${last_time}" \
             -H "Authorization: Bearer ${access_token}")
         
@@ -1964,7 +1972,7 @@ function get_realm_name_by_id() {
     fi
     
     # 모든 realm 목록 조회 (Realm ID로 직접 조회하는 엔드포인트가 없으므로)
-    local realms_list=$(curl -s -X GET \
+    local realms_list=$(curl $CURL_OPT_INSECURE -s -X GET \
         "${KEYCLOAK_URL}/admin/realms" \
         -H "Authorization: Bearer ${access_token}" 2>/dev/null)
     
@@ -2053,7 +2061,7 @@ function get_username_from_event() {
     # 3. userId로 Admin API 호출 (파일에서 못 찾은 경우)
     if [ -n "$user_id" ] && [ "$user_id" != "null" ]; then
         if [ -n "$access_token" ]; then
-            local user_info=$(curl -s -X GET \
+            local user_info=$(curl $CURL_OPT_INSECURE -s -X GET \
                 "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}" \
                 -H "Authorization: Bearer ${access_token}" 2>/dev/null)
             
@@ -2156,7 +2164,7 @@ function convert_admin_event_to_syslog() {
     local username="$user_id"
     if [ "$user_id" != "unknown" ] && [ -n "$access_token" ]; then
         # 1. 기본 realm에서 먼저 검색
-        local user_info=$(curl -s -X GET \
+        local user_info=$(curl $CURL_OPT_INSECURE -s -X GET \
             "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${user_id}" \
             -H "Authorization: Bearer ${access_token}" 2>/dev/null)
         
@@ -2185,7 +2193,7 @@ function convert_admin_event_to_syslog() {
                         echo "DEBUG: 기본 realm(${REALM})에서 사용자를 찾지 못함. authDetails.realmId(${event_realm_id})에 해당하는 realm(${event_realm_name})에서 검색 시도" >&2
                     fi
                     
-                    user_info=$(curl -s -X GET \
+                    user_info=$(curl $CURL_OPT_INSECURE -s -X GET \
                         "${KEYCLOAK_URL}/admin/realms/${event_realm_name}/users/${user_id}" \
                         -H "Authorization: Bearer ${access_token}" 2>/dev/null)
                     
@@ -2382,7 +2390,7 @@ function handle_download_auth_flow() {
     echo "토큰 발급 성공!"
     
     echo "인증 플로우 정보 조회 중..."
-    local auth_flow_info=$(curl -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/authentication/flows" \
+    local auth_flow_info=$(curl $CURL_OPT_INSECURE -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/authentication/flows" \
         -H "Authorization: Bearer ${access_token}")
     
     local flow_exists=$(echo "$auth_flow_info" | jq -r --arg flow_name "$flow_name" '.[] | select(.alias == $flow_name) | .alias')
@@ -2394,7 +2402,7 @@ function handle_download_auth_flow() {
     fi
     
     echo "인증 플로우 상세 정보 조회 중..."
-    local flow_details=$(curl -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/authentication/flows/${flow_name}/executions" \
+    local flow_details=$(curl $CURL_OPT_INSECURE -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/authentication/flows/${flow_name}/executions" \
         -H "Authorization: Bearer ${access_token}")
     
     echo "JSON 파일 생성 중..."
@@ -2784,7 +2792,7 @@ function cmd_refresh_token()
     echo "클라이언트 ID: $SERVICE_ACCOUNT_CLIENT_ID"
     echo ""
     
-    local response=$(curl -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
+    local response=$(curl $CURL_OPT_INSECURE -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -d "grant_type=refresh_token" \
         -d "refresh_token=${refresh_token}" \
