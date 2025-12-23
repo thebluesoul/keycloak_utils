@@ -151,7 +151,8 @@ function load_config() {
 
 # Keycloak 서비스 계정 토큰 발급 함수
 function get_keycloak_token() {
-    local token=$(curl -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
+    local token
+    token=$(curl -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -d "grant_type=client_credentials" \
         -d "client_id=${SERVICE_ACCOUNT_CLIENT_ID}" \
@@ -168,7 +169,8 @@ function get_keycloak_token() {
 
 # Keycloak 서비스 계정 토큰 응답 전체를 반환하는 함수
 function get_token_response() {
-    local response=$(curl -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
+    local response
+    response=$(curl -s -X POST "${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -d "grant_type=client_credentials" \
         -d "client_id=${SERVICE_ACCOUNT_CLIENT_ID}" \
@@ -203,7 +205,8 @@ function decode_token() {
     fi
     
     # JWT는 3부분으로 구성: header.payload.signature
-    local parts=$(echo "$token" | tr '.' '\n' | wc -l)
+    local parts
+    parts=$(echo "$token" | tr '.' '\n' | wc -l)
     if [ "$parts" -ne 3 ]; then
         echo "오류: 유효하지 않은 JWT 토큰 형식입니다." >&2
         return 1
@@ -236,7 +239,8 @@ function display_token_info() {
         return 1
     fi
     
-    local decoded=$(decode_token "$token")
+    local decoded
+    decoded=$(decode_token "$token")
     if [ $? -ne 0 ]; then
         return 1
     fi
@@ -1057,7 +1061,8 @@ function handle_download_groups() {
     echo "파일 경로: $groups_file"
     echo "필터링 모드: $([ "$include_excluded" = "true" ] && echo "제외 사용자 포함" || echo "제외 사용자 제외")"
     
-    local access_token=$(get_keycloak_token)
+    local access_token
+    access_token=$(get_keycloak_token)
     if [ $? -ne 0 ]; then
         return 1
     fi
@@ -1170,7 +1175,8 @@ function handle_download_sessions() {
     echo "파일 경로: $sessions_file"
     echo "필터링 모드: $([ "$include_excluded" = "true" ] && echo "제외 사용자 포함" || echo "제외 사용자 제외")"
     
-    local access_token=$(get_keycloak_token)
+    local access_token
+    access_token=$(get_keycloak_token)
     if [ $? -ne 0 ]; then
         return 1
     fi
@@ -1351,7 +1357,8 @@ function collect_all_user_stats() {
     
     echo "필터링 모드: $([ "$include_excluded" = "true" ] && echo "제외 사용자 포함" || echo "제외 사용자 제외")"
     
-    local access_token=$(get_keycloak_token)
+    local access_token
+    access_token=$(get_keycloak_token)
     if [ $? -ne 0 ]; then
         return 1
     fi
@@ -1551,7 +1558,8 @@ function handle_download_user_events() {
     
     # 2. 토큰 발급
     echo "토큰 발급 중..."
-    local access_token=$(get_keycloak_token)
+    local access_token
+    access_token=$(get_keycloak_token)
     if [ $? -ne 0 ]; then
         echo "오류: 토큰 발급 실패" >&2
         return 1
@@ -1582,7 +1590,8 @@ function handle_download_user_events() {
         page_count=$((page_count + 1))
         
         # API 호출
-        local events=$(curl -s -X GET \
+        local events
+        events=$(curl -s -X GET \
             "${KEYCLOAK_URL}/admin/realms/${REALM}/events?first=${first}&max=${max}&dateFrom=${last_time}" \
             -H "Authorization: Bearer ${access_token}")
         
@@ -1704,7 +1713,8 @@ function handle_download_admin_events() {
     
     # 2. 토큰 발급
     echo "토큰 발급 중..."
-    local access_token=$(get_keycloak_token)
+    local access_token
+    access_token=$(get_keycloak_token)
     if [ $? -ne 0 ]; then
         echo "오류: 토큰 발급 실패" >&2
         return 1
@@ -1735,7 +1745,8 @@ function handle_download_admin_events() {
         page_count=$((page_count + 1))
         
         # API 호출 (admin-events 엔드포인트 사용)
-        local events=$(curl -s -X GET \
+        local events
+        events=$(curl -s -X GET \
             "${KEYCLOAK_URL}/admin/realms/${REALM}/admin-events?first=${first}&max=${max}&dateFrom=${last_time}" \
             -H "Authorization: Bearer ${access_token}")
         
@@ -2263,7 +2274,8 @@ function handle_send_events_to_syslog() {
     echo "Keycloak 서버: $KEYCLOAK_URL"
     echo "렐름: $REALM"
     
-    local access_token=$(get_keycloak_token)
+    local access_token
+    access_token=$(get_keycloak_token)
     if [ $? -ne 0 ]; then
         echo "경고: 토큰 발급 실패. username 조회가 제한될 수 있습니다." >&2
         access_token=""
@@ -2362,7 +2374,8 @@ function handle_download_auth_flow() {
     echo "출력 파일: $output_file"
     echo ""
     
-    local access_token=$(get_keycloak_token)
+    local access_token
+    access_token=$(get_keycloak_token)
     if [ $? -ne 0 ]; then
         return 1
     fi
@@ -2701,7 +2714,8 @@ function cmd_get_token()
     echo "클라이언트 ID: $SERVICE_ACCOUNT_CLIENT_ID"
     echo ""
     
-    local token_response=$(get_token_response)
+    local token_response
+    token_response=$(get_token_response)
     if [ $? -ne 0 ]; then
         return 1
     fi
@@ -2838,7 +2852,9 @@ function cmd_token_info()
         # 토큰이 제공되지 않으면 새로 발급
         echo "토큰이 제공되지 않아 새로 발급합니다..."
         echo ""
-        local token_response=$(get_token_response)
+
+        local token_response
+        token_response=$(get_token_response)
         if [ $? -ne 0 ]; then
             return 1
         fi
