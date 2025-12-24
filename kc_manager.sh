@@ -303,7 +303,8 @@ function display_token_info() {
     
     # Realm 정보
     local realm_access=$(echo "$decoded" | jq -r '.realm_access.roles // []' 2>/dev/null)
-    if [ -n "$realm_access" ] && [ "$realm_access" != "[]" ] && [ "$realm_access" != "null" ]; then
+    local realm_access_count=$(echo "$realm_access" | jq 'length' 2>/dev/null || echo "0")
+    if [ "$realm_access_count" -gt 0 ]; then
         echo "Realm 역할:"
         echo "$realm_access" | jq -r '.[]' | sed 's/^/  - /'
         echo ""
@@ -311,7 +312,8 @@ function display_token_info() {
     
     # Resource access 정보
     local resource_access=$(echo "$decoded" | jq -r '.resource_access // {}' 2>/dev/null)
-    if [ -n "$resource_access" ] && [ "$resource_access" != "{}" ] && [ "$resource_access" != "null" ]; then
+    local resource_access_count=$(echo "$resource_access" | jq 'length' 2>/dev/null || echo "0")
+    if [ "$resource_access_count" -gt 0 ]; then
         echo "리소스 접근 권한:"
         echo "$resource_access" | jq -r 'to_entries[] | "  \(.key): \(.value.roles // [])"' | sed 's/\[\]//g'
         echo ""
@@ -2442,6 +2444,95 @@ function handle_download_auth_flow() {
     fi
 }
 
+# 그룹 역할 조회 처리 함수 (재귀 호출 포함)
+function handle_list_group_roles() {
+    local target_realm="$1"
+    local access_token="$2"
+    local parent_group_id="$3" # 재귀 호출을 위한 부모 그룹 ID
+    local prefix="$4"          # 중첩된 그룹 출력을 위한 접두사
+
+    local groups_url
+    if [ -z "$parent_group_id" ]; then
+        # 최상위 그룹 목록 조회 (briefRepresentation=false로 역할 정보 포함)
+        groups_url="${KEYCLOAK_URL}/admin/realms/${target_realm}/groups?briefRepresentation=false"
+    else
+        # 하위 그룹 목록 조회 (children 엔드포인트 사용)
+        groups_url="${KEYCLOAK_URL}/admin/realms/${target_realm}/groups/${parent_group_id}/children"
+    fi
+
+    # 그룹 목록 조회
+    local groups_response
+    groups_response=$(curl $CURL_OPT_INSECURE -s -X GET "$groups_url" -H "Authorization: Bearer ${access_token}")
+
+    if [ $? -ne 0 ]; then
+        echo "오류: 그룹 목록 조회 API 호출에 실패했습니다. (URL: $groups_url)" >&2
+        return 1
+    fi
+
+    # API 응답은 항상 그룹 목록 배열이므로 바로 파싱
+    local groups
+    groups=$(echo "$groups_response" | jq -c '. // []')
+
+    if ! echo "$groups" | jq -e . >/dev/null 2>&1; then
+        echo "오류: 그룹 목록 응답이 유효한 JSON이 아닙니다." >&2
+        echo "응답: $groups_response" >&2
+        return 1
+    fi
+
+    # 각 그룹을 순회하며 역할 조회 (API 호출 제거 버전 - groups/children 응답에서 직접 파싱)
+    echo "$groups" | jq -c '.[]' | while read -r group; do
+        local group_id=$(echo "$group" | jq -r '.id')
+        local group_name=$(echo "$group" | jq -r '.name')
+        
+        # 1. Realm 역할 파싱 (API 응답 내 realmRoles 필드 사용)
+        # GroupRepresentation에서는 realmRoles가 이미 문자열 배열임
+        local realm_roles
+        realm_roles=$(echo "$group" | jq -r '(.realmRoles // []) | join(", ")')
+        
+        # 2. Client 역할 파싱 (jq로 한 번에 문자열 생성하여 Subshell 문제 해결)
+        local client_roles_output
+        client_roles_output=$(echo "$group" | jq -r '
+            (.clientRoles // {}) | to_entries | 
+            map("[" + .key + ": " + (.value | join(", ")) + "]") | 
+            join(" ")
+        ')
+        
+        # 출력 형식 개선 (트리 구조 + 정렬 개선)
+        # 규칙: 모든 들여쓰기는 5칸 기준입니다. (|-- [공백])
+        
+        # 1. 그룹명 출력 (트리 구조)
+        echo "${prefix}|-- [${group_name}]"
+
+        # 2. 역할 출력용 들여쓰기 설정
+        # 구조: [현재 prefix] + [파이프(|)] + [넓은 공백 15칸]
+        # 이렇게 하면 상위 트리의 줄기(|)가 계속 이어지는 느낌을 줍니다.
+        local role_indent="${prefix}|    |               "
+
+        # Realm Role 출력
+        if [ -n "$realm_roles" ]; then
+            echo "${role_indent}+ Realm : ${realm_roles}"
+        fi
+
+        # Client Role 출력
+        if [ -n "$client_roles_output" ]; then
+            echo "${role_indent}+ Client: ${client_roles_output}"
+        fi
+        
+        # 역할이 없는 경우
+        if [ -z "$realm_roles" ] && [ -z "$client_roles_output" ]; then
+            echo "${role_indent}+ (no roles)"
+        fi
+        
+        # 가독성을 위해 그룹 간 빈 줄 추가 (트리 연결선 유지)
+        echo "${prefix}|"
+
+        # 3. 하위 그룹 재귀 호출
+        # 핵심 수정: 다음 뎁스의 들여쓰기를 정확히 5칸("|    ") 추가
+        # 그래야 하위 그룹이 정확히 안쪽으로 들어갑니다.
+        handle_list_group_roles "$target_realm" "$access_token" "$group_id" "${prefix}|    "
+    done
+}
+
 # 하위 명령 구현
 function cmd_collect_all()
 {
@@ -2911,6 +3002,29 @@ function cmd_epoch_to_datetime()
     return 0
 }
 
+function cmd_list_group_roles()
+{
+    load_config || return 1
+
+    local target_realm="${1:-$REALM}"
+
+    echo "=== 그룹 역할 조회 ==="
+    echo "Realm: $target_realm"
+    echo ""
+
+    # 서비스 계정 토큰 발급
+    # 참고: 이 토큰은 server.conf의 기본 REALM 기준으로 발급됩니다.
+    # 다른 realm을 조회하려면 해당 realm에 대한 권한이 있는 서비스 계정이 필요합니다.
+    local access_token
+    access_token=$(get_keycloak_token)
+    if [ $? -ne 0 ]; then
+        echo "오류: Keycloak 액세스 토큰을 발급할 수 없습니다." >&2
+        return 1
+    fi
+
+    handle_list_group_roles "$target_realm" "$access_token" "" ""
+}
+
 function cmd_help()
 {
     echo "Usage: $0 [command] [options]"
@@ -2939,6 +3053,7 @@ function cmd_help()
     echo "  get_token                            # 토큰 발급 및 정보 표시"
     echo "  refresh_token [refresh_token]        # Refresh token으로 토큰 갱신"
     echo "  token_info [access_token]            # 토큰 정보 확인 (만료 시간, 권한 등)"
+    echo "  list_group_roles [realm_name]        # 렐름의 모든 그룹과 역할을 재귀적으로 조회"
     echo "  help                                 # 도움말 표시"
 }
 
